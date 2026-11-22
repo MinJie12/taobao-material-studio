@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>淘宝商品素材采集与创作工具</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">淘</div>
+        <div class="brand-text">
+          <strong>素材工坊</strong>
+          <span>本地版 · 1688 → 淘宝</span>
+        </div>
+      </div>
+
+      <button class="btn btn-primary btn-block" id="newTaskBtn">新建任务</button>
+
+      <div class="task-list-head">
+        <span>任务列表</span>
+        <span class="count" id="taskCount">0</span>
+      </div>
+      <div id="taskList" class="task-list"></div>
+
+      <div class="sidebar-footer">
+        <button class="btn btn-ghost btn-block" id="settingsBtn">设置</button>
+        <div class="server-info">本地运行 · 数据存本机</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div id="emptyState" class="empty-state">
+        <div class="empty-card">
+          <div class="empty-title">从 1688 商品开始</div>
+          <p>采集素材、套版出图、推荐关键词，全部在本机网页完成。</p>
+          <div class="empty-actions">
+            <button class="btn btn-primary" id="emptyNewBtn">新建任务</button>
+            <button class="btn btn-secondary" id="emptyDemoBtn">导入示例商品</button>
+          </div>
+          <div class="empty-hint">
+            直采可能触发 1688 风控；可改用“导入网页文件 / 导入文件夹 / 手动上传”。
+          </div>
+        </div>
+      </div>
+
+      <div id="taskView" class="hidden">
+        <div id="taskHeader" class="task-header"></div>
+
+        <nav class="tabs" id="tabs">
+          <button data-tab="overview" class="active">概览</button>
+          <button data-tab="raw">原始素材</button>
+          <button data-tab="create">出图</button>
+          <button data-tab="keywords">关键词</button>
+          <button data-tab="export">导出</button>
+        </nav>
+
+        <div id="panel-overview" class="tab-panel active"></div>
+        <div id="panel-raw" class="tab-panel"></div>
+        <div id="panel-create" class="tab-panel"></div>
+        <div id="panel-keywords" class="tab-panel"></div>
+        <div id="panel-export" class="tab-panel"></div>
+      </div>
+    </main>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toastRoot"></div>
+  <script src="/static/vendor/fabric.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

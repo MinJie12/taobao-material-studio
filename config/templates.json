@@ -1,0 +1,78 @@
+{
+  "main": [
+    {
+      "id": "split",
+      "name": "左图右文",
+      "desc": "左侧实拍图，右侧大标题与卖点，适合首图 / 风格人群",
+      "defaults": {
+        "bg": "#F7F4F0",
+        "accent": "#E8467C",
+        "text_color": "#1A1A1A"
+      }
+    },
+    {
+      "id": "overlay",
+      "name": "全图渐变标题",
+      "desc": "全幅实拍 + 顶部渐变标题，适合核心卖点 / 场景",
+      "defaults": {
+        "bg": "#F7F4F0",
+        "accent": "#E8467C",
+        "text_color": "#FFFFFF"
+      }
+    },
+    {
+      "id": "annotate",
+      "name": "细节标注",
+      "desc": "全幅实拍 + 标注线 / 虚线圈，适合细节与版型",
+      "defaults": {
+        "bg": "#F7F4F0",
+        "accent": "#E8467C",
+        "text_color": "#FFFFFF"
+      }
+    },
+    {
+      "id": "band",
+      "name": "色块信息",
+      "desc": "上下色块 + 中部实拍，适合面料 / 功能卖点",
+      "defaults": {
+        "bg": "#F7F4F0",
+        "accent": "#6E2842",
+        "text_color": "#FFFFFF"
+      }
+    },
+    {
+      "id": "grid",
+      "name": "多色网格",
+      "desc": "SKU 颜色网格，适合第 5 张颜色规格",
+      "defaults": {
+        "bg": "#F7F4F0",
+        "accent": "#E8467C",
+        "text_color": "#1A1A1A"
+      }
+    },
+    {
+      "id": "white",
+      "name": "白底图",
+      "desc": "纯白底、无文案，适合推荐流量位（建议单独生成）",
+      "defaults": {
+        "bg": "#FFFFFF",
+        "accent": "#E8467C",
+        "text_color": "#1A1A1A"
+      }
+    }
+  ],
+  "detail": [
+    {
+      "id": "segment",
+      "name": "长图分段",
+      "desc": "按 750 宽重排，超过分段高度自动切分"
+    }
+  ],
+  "sku": [
+    {
+      "id": "card",
+      "name": "SKU 卡片",
+      "desc": "800×800 白底 / 浅底，商品居中，可带颜色名"
+    }
+  ]
+}

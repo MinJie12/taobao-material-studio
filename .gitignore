@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# 本地任务数据（含采集图片、成品图和任务元数据）
+tasks/
+
+# 示例商品与早期脚本生成的素材图片（不建议公开）
+1688_1041092037687/
+淘宝主图/
+淘宝主图_黑色极简/
+淘宝主图_黑色高清/
+详情参考图/
+
+# 本地配置（可能包含 Cookie / API Key，禁止提交）
+config/settings.json
+
+# 日志与临时文件
+*.log
+*.tmp
+*.part
+Thumbs.db
+.DS_Store
+
+# 浏览器缩略图缓存
+.thumbs/

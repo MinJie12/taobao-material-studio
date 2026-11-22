@@ -1,0 +1,69 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "open_browser": true
+  },
+  "download": {
+    "timeout": 30,
+    "retries": 3,
+    "concurrency": 4,
+    "delay": 0.1,
+    "max_file_mb": 40,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "cookie": "",
+    "referer": "https://detail.1688.com/"
+  },
+  "specs": {
+    "main_pc": {
+      "width": 800,
+      "height": 800,
+      "max_bytes": 3145728,
+      "target_bytes": 512000
+    },
+    "main_mobile": {
+      "width": 750,
+      "height": 1000,
+      "max_bytes": 3145728,
+      "target_bytes": 512000
+    },
+    "white": {
+      "width": 800,
+      "height": 800,
+      "max_bytes": 3145728,
+      "target_bytes": 512000
+    },
+    "white_mobile": {
+      "width": 750,
+      "height": 1000,
+      "max_bytes": 3145728,
+      "target_bytes": 512000
+    },
+    "detail": {
+      "width": 750,
+      "max_height": 2000,
+      "segment_height": 1500,
+      "max_bytes": 3145728,
+      "target_bytes": 900000
+    },
+    "sku": {
+      "width": 800,
+      "height": 800,
+      "max_bytes": 3145728,
+      "target_bytes": 512000
+    }
+  },
+  "fonts": {
+    "bold": "C:/Windows/Fonts/msyhbd.ttc",
+    "regular": "C:/Windows/Fonts/msyh.ttc"
+  },
+  "export": {
+    "zip_ascii_names": true
+  },
+  "ai": {
+    "enabled": false,
+    "base_url": "",
+    "api_key": "",
+    "vision_model": ""
+  }
+}
