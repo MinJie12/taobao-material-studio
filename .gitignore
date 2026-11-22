@@ -25,3 +25,6 @@ Thumbs.db
 
 # 浏览器缩略图缓存
 .thumbs/
+
+# 本地安装的工具（GitHub CLI 等）
+.tools/
