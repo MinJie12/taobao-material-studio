@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>主图图层工作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/studio.css">
+  <script defer src="/static/vendor/fabric.min.js"></script>
+  <script defer src="/static/studio.js"></script>
+</head>
+<body class="image-studio">
+  <header class="studio-bar">
+    <div class="studio-context">
+      <a href="/" id="studioBack" class="btn btn-ghost">← 返回出图</a>
+      <div class="studio-heading"><h1 id="studioTitle">主图编辑</h1><p id="studioProduct"></p></div>
+    </div>
+    <div class="studio-toolbar" aria-label="编辑操作">
+      <button class="btn" type="button" id="studioUndo" disabled>撤销</button>
+      <button class="btn" type="button" id="studioRedo" disabled>重做</button>
+      <button class="btn" type="button" id="studioRestore" title="恢复最近一次生成的模板布局" disabled>还原模板</button>
+      <a class="btn hidden" id="studioView" target="_blank" rel="noopener">查看成品</a>
+      <button class="btn btn-primary" type="button" id="studioSave" disabled>保存成品</button>
+    </div>
+  </header>
+  <div class="studio-message" id="studioMessage" role="status">正在加载成品…</div>
+  <main class="studio-workspace">
+    <aside class="studio-sidebar" aria-label="图层">
+      <h2>图层</h2>
+      <div class="studio-actions">
+        <button class="btn btn-sm" id="studioRaise" disabled>上移</button>
+        <button class="btn btn-sm" id="studioLower" disabled>下移</button>
+      </div>
+      <div id="studioLayersList" class="studio-layer-list"></div>
+      <p id="studioEmptyLayers" class="studio-help hidden">暂无图层。</p>
+      <section id="studioLibrary" class="studio-library-panel hidden" aria-label="素材库">
+        <h2>素材库</h2>
+        <p id="studioLibraryHint" class="studio-help">先选中商品图图层。</p>
+        <label class="field"><span>素材分类</span><select id="studioAssetKind"></select></label>
+        <div id="studioAssets" class="studio-assets"></div>
+      </section>
+    </aside>
+    <section class="studio-stage" aria-label="主图画布">
+      <div id="studioStageTools" class="studio-stage-tools hidden">
+        <span id="studioSize"></span>
+        <span id="studioZoom"></span>
+      </div>
+      <div id="studioViewport" class="studio-viewport">
+        <img id="studioLegacy" class="studio-legacy hidden" alt="当前成品">
+        <div id="studioDrawing" class="studio-drawing hidden">
+          <canvas id="studioCanvas"></canvas>
+          <div id="studioMarquee" class="studio-marquee hidden"><div id="studioMarqueeBox" hidden></div></div>
+        </div>
+      </div>
+    </section>
+    <aside class="studio-sidebar" aria-label="图层属性">
+      <h2>图层属性</h2>
+      <p id="studioSelection">选择图层后可调整位置和尺寸。</p>
+      <form id="studioGeometry" class="studio-geometry hidden">
+        <label class="field"><span>横向位置（px）</span><input type="number" name="left" step="1" required></label>
+        <label class="field"><span>纵向位置（px）</span><input type="number" name="top" step="1" required></label>
+        <label class="field"><span>宽度（px）</span><input type="number" name="width" min="1" step="1" required></label>
+        <label class="field"><span>高度（px）</span><input type="number" name="height" min="1" step="1" required></label>
+        <label class="field"><span>不透明度（%）</span><input type="number" name="opacity" min="0" max="100" step="1" required></label>
+      </form>
+      <p class="studio-help hidden" id="studioHelp"></p>
+      <section id="studioPixelTools" class="studio-library-panel hidden" aria-label="商品图处理">
+        <h2>商品图处理</h2>
+        <div class="studio-actions">
+          <button class="btn btn-sm" id="studioCutout">一键去背景</button>
+          <button class="btn btn-sm" id="studioSelect" aria-pressed="false">矩形选区</button>
+        </div>
+        <p id="studioSelectionHint" class="studio-help" aria-live="polite"></p>
+        <div class="studio-actions hidden" id="studioSelectionActions">
+          <button class="btn btn-sm" id="studioInvert" aria-pressed="false">反选</button>
+          <button class="btn btn-sm" id="studioClearPixels">清除选区</button>
+          <button class="btn btn-sm" id="studioKeepPixels">保留选区</button>
+          <button class="btn btn-sm" id="studioCancelSelection">取消选区</button>
+        </div>
+      </section>
+      <div id="studioPrepareBox" class="hidden">
+        <p class="studio-help">这张旧成品只有合并图。可用原始素材和模板重建图层，重建后的样式可能与当前成品有差异。</p>
+        <button class="btn btn-primary" type="button" id="studioPrepare">重建可编辑布局</button>
+      </div>
+    </aside>
+  </main>
+</body>
+</html>

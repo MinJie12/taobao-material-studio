@@ -55,7 +55,16 @@ DEFAULT_SETTINGS = {
         "regular": "C:/Windows/Fonts/msyh.ttc",
     },
     "export": {"zip_ascii_names": True},
-    "ai": {"enabled": False, "base_url": "", "api_key": "", "vision_model": ""},
+    "ai": {
+        "enabled": False,
+        "provider": "ollama",
+        "ollama_url": "http://127.0.0.1:11434",
+        "base_url": "",
+        "api_key": "",
+        "text_model": "",
+        "vision_model": "",
+        "timeout": 20,
+    },
 }
 
 

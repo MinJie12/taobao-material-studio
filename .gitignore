@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.pyc
+.venv/
 
 # 本地任务数据（含采集图片、成品图和任务元数据）
 tasks/

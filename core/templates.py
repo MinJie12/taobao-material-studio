@@ -2,12 +2,15 @@
 """主图 / 详情 / SKU / 白底图模板渲染。"""
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from pathlib import Path
+from uuid import uuid4
 
 from PIL import Image, ImageDraw
 
-from . import config, imaging, keywords, storage
+from . import config, imaging, keywords, main_design, storage
 
 SLOT_ROLES = {
     "1": "首图 · 吸引点击",
@@ -58,15 +61,69 @@ def _load_photo(task_id: str, rel: str) -> Image.Image:
 
 def _photo_for(ctx: dict, size: tuple[int, int], mode: str = "cover", bg=(255, 255, 255)) -> Image.Image:
     photo = ctx["photo"]
+    zoom = ctx.get("photo_zoom", 1)
+    offset_x = ctx.get("photo_x", 0)
+    offset_y = ctx.get("photo_y", 0)
     if mode == "whiten":
         photo = imaging.whiten_background(photo)
+        mode = "contain"
     if mode == "contain":
-        return imaging.fit_contain(photo, size, bg=bg)
-    return imaging.fit_cover(photo, size)
+        return imaging.fit_contain_focus(
+            photo, size, bg=bg, zoom=zoom, offset_x=offset_x, offset_y=offset_y,
+        )
+    return imaging.fit_cover_focus(
+        photo, size, zoom=zoom, offset_x=offset_x, offset_y=offset_y, bg=bg,
+    )
 
 
 def _draw(canvas: Image.Image) -> ImageDraw.ImageDraw:
     return ImageDraw.Draw(canvas, "RGBA")
+
+
+def _template_surface(ctx: dict, bg) -> Image.Image:
+    if "layers" in ctx:
+        return Image.new("RGBA", ctx["size"])
+    return Image.new("RGB", ctx["size"], bg)
+
+
+def _place_product(ctx: dict, canvas: Image.Image, photo: Image.Image, x=0, y=0, *, name="商品图", mask=None) -> None:
+    if "layers" in ctx:
+        if mask is not None:
+            photo = photo.convert("RGBA")
+            photo.putalpha(mask)
+        ctx["layers"].append((name, photo, x, y, False))
+    else:
+        canvas.paste(photo, (x, y), mask)
+
+
+def _element_surface(ctx: dict, draw, name: str):
+    if "layers" not in ctx:
+        return draw
+    layer = Image.new("RGBA", ctx["size"])
+    ctx["elements"].append((name, layer))
+    return _draw(layer)
+
+
+def _headline(ctx: dict, draw, xy, lines, font, fill, line_height, **options):
+    label = ctx["headline"] or "主标题"
+    return imaging.draw_text_lines(
+        _element_surface(ctx, draw, label), xy, lines, font, fill, line_height, **options,
+    )
+
+
+def main_composition(template: str, ctx: dict) -> tuple[Image.Image, list]:
+    ctx = {**ctx, "layers": [], "elements": []}
+    decorations = RENDERERS[template](ctx)
+    canvas = Image.new("RGBA", ctx["size"], (255, 255, 255) if template == "white" else ctx["bg"])
+    overlays = [("模板装饰", decorations, False), *((name, image, False) for name, image in ctx["elements"])]
+    layers = ctx["layers"]
+    for name, image, locked in overlays:
+        bounds = image.getbbox()
+        if bounds:
+            layers.append((name, image.crop(bounds), bounds[0], bounds[1], locked))
+    for _, image, x, y, _ in layers:
+        canvas.alpha_composite(image.convert("RGBA"), (x, y))
+    return canvas.convert("RGB"), layers
 
 
 def _is_mobile(size: tuple[int, int]) -> bool:
@@ -146,16 +203,16 @@ def _draw_badge(
 def render_split(ctx: dict) -> Image.Image:
     width, height = ctx["size"]
     accent, bg, text_color = ctx["accent"], ctx["bg"], ctx["text_color"]
-    canvas = Image.new("RGB", (width, height), bg)
+    canvas = _template_surface(ctx, bg)
     draw = _draw(canvas)
     if not ctx["show_text"]:
-        canvas.paste(_photo_for(ctx, (width, height), ctx["photo_mode"], bg), (0, 0))
+        _place_product(ctx, canvas, _photo_for(ctx, (width, height), ctx["photo_mode"], bg))
         return canvas
     mobile = _is_mobile((width, height))
     if mobile:
         photo_h = int(height * 0.60)
         photo = _photo_for(ctx, (width, photo_h), ctx["photo_mode"], bg)
-        canvas.paste(photo, (0, 0))
+        _place_product(ctx, canvas, photo)
         imaging.add_gradient(canvas, (0, photo_h - int(height * 0.08), width, photo_h), bg + (0,), bg + (255,))
         x = int(width * 0.055)
         text_w = width - x * 2
@@ -163,7 +220,7 @@ def render_split(ctx: dict) -> Image.Image:
         font, lines, line_h = imaging.fit_text(
             draw, ctx["headline"], True, text_w, int(height * 0.16), int(width * 0.085), 30, 2
         )
-        y = imaging.draw_text_lines(draw, (x, y), lines, font, text_color, line_h, shadow=False)
+        y = _headline(ctx, draw, (x, y), lines, font, text_color, line_h, shadow=False)
         if ctx["subhead"]:
             font2, lines2, lh2 = imaging.fit_text(
                 draw, ctx["subhead"], False, text_w, int(height * 0.06), int(width * 0.034), 16, 1
@@ -175,13 +232,13 @@ def render_split(ctx: dict) -> Image.Image:
             max_items=2, max_lines=1,
         )
         if ctx["badge"]:
-            _draw_badge(draw, (width, height), ctx["badge"], accent, y=int(height * 0.035), x=None)
+            _draw_badge(_element_surface(ctx, draw, ctx["badge"]), (width, height), ctx["badge"], accent, y=int(height * 0.035))
         _draw_footer(draw, (width, height), ctx["footer"], accent, _body_color(ctx))
         return canvas
 
     photo_w = int(width * 0.60)
     photo = _photo_for(ctx, (photo_w, height), ctx["photo_mode"], bg)
-    canvas.paste(photo, (0, 0))
+    _place_product(ctx, canvas, photo)
     draw.rectangle([photo_w - 2, int(height * 0.07), photo_w + 2, int(height * 0.93)], fill=accent + (80,))
     x = photo_w + int(width * 0.055)
     text_w = width - x - int(width * 0.05)
@@ -189,7 +246,7 @@ def render_split(ctx: dict) -> Image.Image:
     font, lines, line_h = imaging.fit_text(
         draw, ctx["headline"], True, text_w, int(height * 0.34), int(width * 0.092), 34, 3
     )
-    y = imaging.draw_text_lines(draw, (x, y), lines, font, text_color, line_h)
+    y = _headline(ctx, draw, (x, y), lines, font, text_color, line_h)
     if ctx["subhead"]:
         font2, lines2, lh2 = imaging.fit_text(
             draw, ctx["subhead"], False, text_w, int(height * 0.12), int(width * 0.036), 18, 2
@@ -201,7 +258,7 @@ def render_split(ctx: dict) -> Image.Image:
         max_items=3, max_lines=1,
     )
     if ctx["badge"]:
-        _draw_badge(draw, (width, height), ctx["badge"], accent, x=x, y=int(height * 0.78))
+        _draw_badge(_element_surface(ctx, draw, ctx["badge"]), (width, height), ctx["badge"], accent, x=x, y=int(height * 0.78))
     _draw_footer(draw, (width, height), ctx["footer"], accent, _body_color(ctx))
     return canvas
 
@@ -209,9 +266,9 @@ def render_split(ctx: dict) -> Image.Image:
 def render_overlay(ctx: dict) -> Image.Image:
     width, height = ctx["size"]
     accent, bg, text_color = ctx["accent"], ctx["bg"], ctx["text_color"]
-    canvas = Image.new("RGB", (width, height), bg)
+    canvas = _template_surface(ctx, bg)
     photo = _photo_for(ctx, (width, height), ctx["photo_mode"], bg)
-    canvas.paste(photo, (0, 0))
+    _place_product(ctx, canvas, photo)
     if not ctx["show_text"]:
         return canvas
     draw = _draw(canvas)
@@ -223,7 +280,7 @@ def render_overlay(ctx: dict) -> Image.Image:
     font, lines, line_h = imaging.fit_text(
         draw, ctx["headline"], True, text_w, int(height * 0.18), int(width * 0.088), 30, 2
     )
-    y = imaging.draw_text_lines(draw, (x, y), lines, font, (255, 255, 255), line_h, shadow=True)
+    y = _headline(ctx, draw, (x, y), lines, font, (255, 255, 255), line_h, shadow=True)
     if ctx["subhead"]:
         font2, lines2, lh2 = imaging.fit_text(
             draw, ctx["subhead"], False, text_w, int(height * 0.10), int(width * 0.032), 16, 2
@@ -236,7 +293,7 @@ def render_overlay(ctx: dict) -> Image.Image:
         tw, _ = imaging.text_metrics(draw, ctx["badge"], font_b)
         pad = max(12, int(width * 0.018))
         _draw_badge(
-            draw, (width, height), ctx["badge"], accent,
+            _element_surface(ctx, draw, ctx["badge"]), (width, height), ctx["badge"], accent,
             x=width - int(width * 0.05) - tw - pad * 2, y=int(height * 0.05),
         )
     bullets = (ctx["bullets"] or [])[:3]
@@ -262,9 +319,9 @@ def render_overlay(ctx: dict) -> Image.Image:
 def render_annotate(ctx: dict) -> Image.Image:
     width, height = ctx["size"]
     accent, bg, text_color = ctx["accent"], ctx["bg"], ctx["text_color"]
-    canvas = Image.new("RGB", (width, height), bg)
+    canvas = _template_surface(ctx, bg)
     photo = _photo_for(ctx, (width, height), ctx["photo_mode"], bg)
-    canvas.paste(photo, (0, 0))
+    _place_product(ctx, canvas, photo)
     if not ctx["show_text"]:
         return canvas
     draw = _draw(canvas)
@@ -274,7 +331,7 @@ def render_annotate(ctx: dict) -> Image.Image:
     font, lines, line_h = imaging.fit_text(
         draw, ctx["headline"], True, int(width * 0.88), int(height * 0.14), int(width * 0.075), 28, 2
     )
-    y = imaging.draw_text_lines(draw, (x, y), lines, font, (255, 255, 255), line_h, shadow=True)
+    y = _headline(ctx, draw, (x, y), lines, font, (255, 255, 255), line_h, shadow=True)
     if ctx["subhead"]:
         font2, lines2, lh2 = imaging.fit_text(
             draw, ctx["subhead"], False, int(width * 0.88), int(height * 0.07), int(width * 0.028), 14, 1
@@ -319,9 +376,9 @@ def render_band(ctx: dict) -> Image.Image:
     width, height = ctx["size"]
     accent, bg, text_color = ctx["accent"], ctx["bg"], ctx["text_color"]
     dark = imaging.mix_color(accent, (20, 16, 18), 0.42)
-    canvas = Image.new("RGB", (width, height), bg)
+    canvas = _template_surface(ctx, bg)
     if not ctx["show_text"]:
-        canvas.paste(_photo_for(ctx, (width, height), ctx["photo_mode"], bg), (0, 0))
+        _place_product(ctx, canvas, _photo_for(ctx, (width, height), ctx["photo_mode"], bg))
         return canvas
     mobile = _is_mobile((width, height))
     band_h = int(height * (0.155 if mobile else 0.19))
@@ -332,7 +389,7 @@ def render_band(ctx: dict) -> Image.Image:
     font, lines, line_h = imaging.fit_text(
         draw, ctx["headline"], True, int(width * 0.72), band_h - int(height * 0.055), int(width * 0.062), 24, 2
     )
-    imaging.draw_text_lines(draw, (x, int(height * 0.028)), lines, font, (255, 255, 255), line_h, shadow=False)
+    _headline(ctx, draw, (x, int(height * 0.028)), lines, font, (255, 255, 255), line_h, shadow=False)
     if ctx["subhead"]:
         font2, lines2, lh2 = imaging.fit_text(
             draw, ctx["subhead"], False, int(width * 0.72), int(height * 0.045), int(width * 0.026), 13, 1
@@ -345,10 +402,10 @@ def render_band(ctx: dict) -> Image.Image:
     tw, _ = imaging.text_metrics(draw, badge_text, font_b)
     pad = max(10, int(width * 0.014))
     box = (width - int(width * 0.05) - tw - pad * 2, int(height * 0.035), width - int(width * 0.05), int(height * 0.035) + int(height * 0.042))
-    imaging.draw_pill(draw, box, (255, 255, 255, 38), badge_text, font_b, (255, 255, 255), outline=(255, 255, 255, 120), outline_width=2)
+    imaging.draw_pill(_element_surface(ctx, draw, badge_text), box, (255, 255, 255, 38), badge_text, font_b, (255, 255, 255), outline=(255, 255, 255, 120), outline_width=2)
     photo_box = (0, band_h, width, height - bottom_h)
     photo = _photo_for(ctx, (width, photo_box[3] - photo_box[1]), ctx["photo_mode"], bg)
-    canvas.paste(photo, (0, band_h))
+    _place_product(ctx, canvas, photo, y=band_h)
     imaging.add_gradient(canvas, (0, height - bottom_h, width, height), dark + (0,), dark + (225,))
     bullets = [str(item) for item in (ctx["bullets"] or []) if item][:4]
     if bullets:
@@ -376,14 +433,14 @@ def render_band(ctx: dict) -> Image.Image:
 def render_grid(ctx: dict) -> Image.Image:
     width, height = ctx["size"]
     accent, bg, text_color = ctx["accent"], ctx["bg"], ctx["text_color"]
-    canvas = Image.new("RGB", (width, height), bg)
+    canvas = _template_surface(ctx, bg)
     draw = _draw(canvas)
     mobile = _is_mobile((width, height))
     title = ctx["headline"] or "多色可选"
     font, lines, line_h = imaging.fit_text(
         draw, title, True, int(width * 0.86), int(height * 0.09), int(width * 0.075), 30, 1
     )
-    imaging.draw_text_lines(draw, (width // 2, int(height * 0.035)), lines, font, text_color, line_h, align="center")
+    _headline(ctx, draw, (width // 2, int(height * 0.035)), lines, font, text_color, line_h, align="center")
     subhead_y = int(height * (0.125 if mobile else 0.115))
     line_y = int(height * (0.175 if mobile else 0.16))
     if ctx["subhead"]:
@@ -421,18 +478,20 @@ def render_grid(ctx: dict) -> Image.Image:
         x = start_x + col * (tile + gap)
         y = start_y + row * (tile + label_h + gap)
         radius = max(10, int(tile * 0.10))
+        image = item.get("image")
         draw.rounded_rectangle(
-            [x, y, x + tile, y + tile], radius=radius, fill=(255, 255, 255),
+            [x, y, x + tile, y + tile], radius=radius,
+            fill=None if "layers" in ctx and isinstance(image, Image.Image) else (255, 255, 255),
             outline=(228, 220, 214), width=2,
         )
         if item.get("more"):
             draw.text((x + tile // 2, y + tile // 2 - int(tile * 0.10)), "更多", font=label_font, fill=accent, anchor="mm")
             draw.text((x + tile // 2, y + tile // 2 + int(tile * 0.04)), "颜色", font=label_font, fill=accent, anchor="mm")
         else:
-            image = item.get("image")
             if isinstance(image, Image.Image):
                 fitted = imaging.fit_contain(image, (tile, tile), bg=(255, 255, 255), padding=max(4, int(tile * 0.05)))
-                imaging.paste_rounded(canvas, fitted, (x, y), radius)
+                _place_product(ctx, canvas, fitted, x, y, name=f"商品图 · {item['name']}",
+                               mask=imaging.rounded_mask(fitted.size, radius))
         name = str(item.get("name", ""))[:8]
         tw, _ = imaging.text_metrics(draw, name, label_font)
         draw.text((x + (tile - tw) // 2, y + tile + int(label_h * 0.22)), name, font=label_font, fill=text_color)
@@ -443,19 +502,24 @@ def render_grid(ctx: dict) -> Image.Image:
     box_w = min(width - margin_x * 2, tw + pad * 2)
     bx = (width - box_w) // 2
     by = height - int(height * 0.065) - int(height * 0.05)
-    imaging.draw_pill(draw, (bx, by, bx + box_w, by + int(height * 0.05)), accent, footer, font3, (255, 255, 255))
+    imaging.draw_pill(_element_surface(ctx, draw, footer), (bx, by, bx + box_w, by + int(height * 0.05)), accent, footer, font3, (255, 255, 255))
     return canvas
 
 
 def render_white_canvas(ctx: dict) -> Image.Image:
     width, height = ctx["size"]
-    canvas = Image.new("RGB", (width, height), (255, 255, 255))
+    canvas = _template_surface(ctx, (255, 255, 255))
     photo = ctx["photo"]
     if ctx.get("whiten", True):
         photo = imaging.whiten_background(photo)
     padding = int(min(width, height) * (0.085 if _is_mobile((width, height)) else 0.075))
-    fitted = imaging.fit_contain(photo, (width, height), bg=(255, 255, 255), padding=padding)
-    canvas.paste(fitted, (0, 0))
+    fitted = imaging.fit_contain_focus(
+        photo, (width, height), bg=(255, 255, 255), padding=padding,
+        zoom=ctx.get("photo_zoom", 1),
+        offset_x=ctx.get("photo_x", 0),
+        offset_y=ctx.get("photo_y", 0),
+    )
+    _place_product(ctx, canvas, fitted)
     return canvas
 
 
@@ -531,12 +595,74 @@ def _color_items(task_id: str, meta: dict) -> list[dict]:
     return items
 
 
+def _main_context(size, photo, options: dict, design: dict, color_items: list) -> dict:
+    return {
+        "size": size,
+        "photo": photo,
+        "headline": str(options.get("headline") or ""),
+        "subhead": str(options.get("subhead") or ""),
+        "bullets": [str(item) for item in (options.get("bullets") or []) if str(item).strip()],
+        "badge": str(options.get("badge") or ""),
+        "footer": str(options.get("footer") or ""),
+        "accent": imaging.hex_to_rgb(options.get("accent") or "#E8467C"),
+        "bg": imaging.hex_to_rgb(options.get("bg") or design.get("background") or "#F7F4F0"),
+        "text_color": imaging.hex_to_rgb(options.get("text_color") or "#1A1A1A"),
+        "photo_mode": str(options.get("photo_mode") or "cover"),
+        "photo_zoom": float(options.get("photo_zoom", 1) or 1) * float(design.get("productScale", 1) or 1),
+        "photo_x": options.get("photo_x", 0),
+        "photo_y": options.get("photo_y", 0),
+        "show_text": bool(options.get("show_text", True)),
+        "color_items": color_items,
+        "whiten": bool(options.get("whiten", True)),
+    }
+
+
+def prepare_main_design(task_id: str, kind: str, slot: int, expected: str, *, template_only=False) -> dict:
+    meta = storage.load_meta(task_id)
+    record = main_design.get_record(meta, kind, slot)
+    main_design.check_revision(record, expected)
+    if template_only and record.get("templateEditor"):
+        return main_design.editable_record({"editor": record["templateEditor"]})["editor"]
+    if record.get("editor") and not template_only:
+        return record
+    options = default_slot_options(task_id, meta)["slots"][slot - 1]
+    for key in ("template", "source", "headline", "subhead"):
+        if key in record and (record[key] or key in ("headline", "subhead")):
+            options[key] = record[key]
+    template = options["template"]
+    photo = _load_photo(task_id, options["source"])
+    size = (record["width"], record["height"])
+    colors = _color_items(task_id, meta) if template == "grid" else []
+    ctx = _main_context(size, photo, options, {}, colors)
+    canvas, layers = main_composition(template, ctx)
+    project = main_design.layer_project(task_id, kind, slot, canvas, _main_background(template, ctx), layers)
+    project["reconstructed"] = True
+
+    def update(current: dict) -> None:
+        result = main_design.get_record(current, kind, slot)
+        main_design.check_revision(result, expected)
+        result.setdefault("templateEditor", project)
+        result.setdefault("templateSource", options["source"])
+        if not template_only:
+            result.setdefault("editor", project)
+
+    result = main_design.get_record(storage.update_meta(task_id, update), kind, slot)
+    if template_only:
+        return main_design.editable_record({"editor": result["templateEditor"]})["editor"]
+    return result
+
+
+def _main_background(template: str, ctx: dict) -> tuple:
+    return (255, 255, 255) if template == "white" else ctx["bg"]
+
+
 def render_main_slot(task_id: str, slot: int, options: dict, meta: dict | None = None) -> dict:
     slot = int(slot)
     if slot < 1 or slot > 5:
         raise ValueError("主图卡位必须是 1-5")
     meta = meta or storage.load_meta(task_id)
     options = dict(options or {})
+    design = meta.get("design") if isinstance(meta.get("design"), dict) else {}
     template = str(options.get("template") or DEFAULT_TEMPLATES.get(str(slot), "split"))
     if template not in RENDERERS:
         raise ValueError(f"未知模板: {template}")
@@ -553,46 +679,38 @@ def render_main_slot(task_id: str, slot: int, options: dict, meta: dict | None =
         variants = [variants]
     color_items = _color_items(task_id, meta) if template == "grid" else []
     records = {}
-    for variant in variants:
-        if variant not in ("pc", "mobile"):
-            continue
-        kind = "main_pc" if variant == "pc" else "main_mobile"
-        spec = _spec(kind)
-        size = (int(spec.get("width", 800)), int(spec.get("height", 800)))
-        ctx = {
-            "size": size,
-            "photo": photo,
-            "headline": str(options.get("headline") or ""),
-            "subhead": str(options.get("subhead") or ""),
-            "bullets": [str(item) for item in (options.get("bullets") or []) if str(item).strip()],
-            "badge": str(options.get("badge") or ""),
-            "footer": str(options.get("footer") or ""),
-            "accent": imaging.hex_to_rgb(options.get("accent") or "#E8467C"),
-            "bg": imaging.hex_to_rgb(options.get("bg") or "#F7F4F0"),
-            "text_color": imaging.hex_to_rgb(options.get("text_color") or "#1A1A1A"),
-            "photo_mode": str(options.get("photo_mode") or "cover"),
-            "show_text": bool(options.get("show_text", True)),
-            "color_items": color_items,
-            "whiten": bool(options.get("whiten", True)),
-        }
-        canvas = RENDERERS[template](ctx)
-        out_dir = storage.output_dir(task_id, kind)
-        path = out_dir / f"{slot:02d}.jpg"
-        canvas.save(path, "JPEG", quality=95)
-        record = _finalize_record(task_id, kind, path, template, source, options)
-        records[variant] = record
-
-    def _update(meta_obj: dict):
-        for variant, record in records.items():
+    task_root = storage.task_path(task_id)
+    with tempfile.TemporaryDirectory(dir=task_root) as temporary:
+        pending = {}
+        for variant in variants:
+            if variant not in ("pc", "mobile") or variant in records:
+                continue
             kind = "main_pc" if variant == "pc" else "main_mobile"
-            meta_obj.setdefault("outputs", {}).setdefault(kind, {})
-            meta_obj["outputs"][kind][str(slot)] = record
-        meta_obj["status"] = "generated"
-        meta_obj["statusText"] = "已出图"
-        storage.add_log(meta_obj, f"生成主图卡位 {slot}：{template}（{', '.join(records.keys())}）")
-        return meta_obj
+            spec = _spec(kind)
+            size = (int(spec.get("width", 800)), int(spec.get("height", 800)))
+            ctx = _main_context(size, photo, options, design, color_items)
+            canvas, layers = main_composition(template, ctx)
+            project = main_design.layer_project(task_id, kind, slot, canvas, _main_background(template, ctx), layers)
+            path = Path(temporary) / f"{kind}.jpg"
+            target = storage.output_dir(task_id, kind) / f"{slot:02d}.jpg"
+            canvas.save(path, "JPEG", quality=95)
+            record = _finalize_record(task_id, kind, path, template, source, options)
+            record.update(file=target.relative_to(task_root).as_posix(),
+                          previewVersion=str(path.stat().st_mtime_ns), editor=project,
+                          templateEditor=project, templateSource=source)
+            records[variant] = record
+            pending[variant] = (kind, path, target)
 
-    storage.update_meta(task_id, _update)
+        def _update(meta_obj: dict) -> None:
+            for variant, record in records.items():
+                kind, path, target = pending[variant]
+                os.replace(path, target)
+                meta_obj.setdefault("outputs", {}).setdefault(kind, {})[str(slot)] = record
+            meta_obj["status"] = "generated"
+            meta_obj["statusText"] = "已出图"
+            storage.add_log(meta_obj, f"生成主图卡位 {slot}：{template}（{', '.join(records.keys())}）")
+
+        storage.update_meta(task_id, _update)
     return records
 
 
@@ -645,6 +763,9 @@ def default_slot_options(task_id: str, meta: dict | None = None) -> dict:
             "bg": "#F7F4F0",
             "text_color": "#1A1A1A",
             "photo_mode": "cover",
+            "photo_zoom": 1,
+            "photo_x": 0,
+            "photo_y": 0,
             "show_text": True,
         })
     return {
@@ -673,9 +794,130 @@ def render_all_main(task_id: str, slots: list[dict] | None = None, meta: dict | 
     return {"records": results, "errors": errors}
 
 
+DETAIL_SEQUENCE = (
+    ("商品全貌", r"首屏|首图|封面|全貌|主图|\b(?:hero|cover|overview)\b"),
+    ("核心卖点", r"卖点|亮点|优势|功能|\b(?:features?|benefits?)\b"),
+    ("使用场景", r"场景|实拍|穿搭|上身|\b(?:scene|lifestyle|usage)\b"),
+    ("细节展示", r"细节|工艺|材质|面料|\b(?:closeup|texture|material)\b"),
+    ("规格参数", r"规格|参数|尺码|尺寸|色卡|\b(?:specs?|size|dimensions)\b"),
+    ("选购说明", r"售后|保养|洗涤|包装|安装|说明|\b(?:care|guide|shipping)\b"),
+)
+DETAIL_ROLE_PATTERNS = tuple((label, re.compile(pattern, re.I)) for label, pattern in DETAIL_SEQUENCE)
+
+
+def detail_source_role(name: str) -> tuple[int, str]:
+    stem = re.sub(r"[_-]+", " ", name)
+    # Keep unrecognized materials together in their existing order.
+    for index in (4, 5, 0, 1, 2, 3):
+        label, pattern = DETAIL_ROLE_PATTERNS[index]
+        if pattern.search(stem):
+            return index * 2, label
+    return 7, ""
+
+
+def beautify_detail_page(task_id: str, sources: list[str], *, auto_order: bool = False) -> list[dict]:
+    groups = storage.scan_raw(task_id)
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("请至少选择一张详情素材")
+    allowed = set(groups["detail"] + groups["main"])
+    if any(not isinstance(source, str) or source not in allowed for source in sources):
+        raise ValueError("所选详情素材已移动或删除，请重新选择")
+    sources = list(dict.fromkeys(sources))
+    raw = storage.load_meta(task_id).get("raw", {})
+    names = {
+        item.get("file"): item.get("name")
+        for kind in ("detail", "main") for item in raw.get(kind, [])
+    }
+    roles = {source: detail_source_role(str(names.get(source) or Path(source).stem)) for source in sources}
+    if auto_order:
+        sources.sort(key=lambda source: roles[source][0])
+    spec = _spec("detail")
+    width = int(spec["width"])
+    max_height = int(spec.get("max_height") or spec["segment_height"])
+    height = min(int(spec["segment_height"]), max_height)
+    max_bytes = int(spec.get("max_bytes") or 0)
+    target_bytes = int(spec.get("target_bytes") or max_bytes or 0)
+    if max_bytes:
+        target_bytes = min(target_bytes, max_bytes)
+    if width < 1 or height < 1:
+        raise ValueError("请检查设置中的详情页宽度和分段高度")
+
+    root = storage.task_path(task_id)
+    out_dir = storage.output_dir(task_id, "detail")
+    generation = uuid4().hex[:10]
+    records = []
+    previous_names = []
+    with tempfile.TemporaryDirectory(dir=root) as temporary:
+        staged = Path(temporary)
+        for index, source in enumerate(sources, 1):
+            try:
+                image = imaging.load_detail_image(_raw_path(task_id, source))
+                original_width = image.width
+                total_height = max(1, round(image.height * width / image.width))
+                if image.width != width:
+                    image = image.resize((width, total_height), imaging.RESAMPLE)
+                image = imaging.beautify_detail(image, upscaled=original_width < width)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"无法处理素材 {Path(source).name}：{exc}") from exc
+            pending = list(reversed(imaging.detail_segment_ranges(image, height)))
+            segment = 0
+            while pending:
+                top, bottom = pending.pop()
+                name = f"detail_{index:02d}_{segment + 1:02d}_{generation}.jpg"
+                path = staged / name
+                info = imaging.save_jpeg(image.crop((0, top, width, bottom)), path, target_bytes, max_bytes,
+                                         subsampling=0, preferred_quality=82)
+                if not info["within_max"]:
+                    if bottom - top <= 1:
+                        raise ValueError(f"素材 {Path(source).name} 无法压缩到当前文件上限，请检查详情规格")
+                    middle = (top + bottom) // 2
+                    pending.extend([(middle, bottom), (top, middle)])
+                    continue
+                issues = imaging.validate_output(path, spec, "detail")
+                if original_width < width:
+                    issues.append(f"原图宽 {original_width}px，已等比放大至 {width}px；放大无法恢复原本缺失的细节")
+                if info["quality"] < 75:
+                    issues.append("图片内容较复杂，已加大压缩")
+                segment += 1
+                records.append({
+                    **info, "file": (out_dir / name).relative_to(root).as_posix(),
+                    "source": source, "sourceIndex": index, "segment": segment, "template": "detail_beauty",
+                    "sourceRole": roles[source][1], "autoOrdered": auto_order,
+                    "issues": issues, "updatedAt": storage.now(),
+                })
+
+        def publish(meta_obj: dict) -> None:
+            for record in records:
+                filename = Path(record["file"]).name
+                os.replace(staged / filename, out_dir / filename)
+            outputs = meta_obj.setdefault("outputs", {})
+            previous = outputs.get("detail") or []
+            if isinstance(previous, dict):
+                previous = previous.values()
+            previous_names.extend(
+                Path(item["file"]).name for item in previous
+                if isinstance(item, dict) and re.fullmatch(r"output/detail/detail_[\w]+\.jpg", item.get("file") or "")
+            )
+            outputs["detail"] = records
+            meta_obj["status"] = "generated"
+            meta_obj["statusText"] = "已出图"
+            storage.add_log(meta_obj, f"一键美化详情页：{len(sources)} 张素材，{len(records)} 个分段")
+
+        storage.update_meta(task_id, publish)
+        for name in previous_names:
+            try:
+                (out_dir / name).unlink(missing_ok=True)
+            except OSError:
+                pass
+    return records
+
+
 def render_detail(task_id: str, options: dict | None = None, meta: dict | None = None) -> list[dict]:
     options = dict(options or {})
+    if options.get("beautify") is True:
+        return beautify_detail_page(task_id, options.get("sources"), auto_order=options.get("auto_order") is True)
     meta = meta or storage.load_meta(task_id)
+    design = meta.get("design") if isinstance(meta.get("design"), dict) else {}
     spec = _spec("detail")
     width = int(options.get("width") or spec.get("width", 750))
     segment_height = int(options.get("segment_height") or spec.get("segment_height", 1500))
@@ -692,9 +934,12 @@ def render_detail(task_id: str, options: dict | None = None, meta: dict | None =
         except OSError:
             pass
     records = []
+    enhance_enabled = bool(options.get("enhance", True))
     for source_index, rel in enumerate(sources, 1):
         path = _raw_path(task_id, rel)
-        im = imaging.enhance(imaging.load_image(path), color=1.02, contrast=1.02)
+        im = imaging.load_image(path)
+        if enhance_enabled:
+            im = imaging.enhance(im, color=1.02, contrast=1.02)
         low_res = im.width < width
         if im.width != width:
             new_h = max(1, int(im.height * width / im.width))
@@ -730,9 +975,12 @@ def render_detail(task_id: str, options: dict | None = None, meta: dict | None =
                     "badge": "",
                     "footer": str(options.get("cover_footer") or "详情页"),
                     "accent": imaging.hex_to_rgb(options.get("accent") or "#E8467C"),
-                    "bg": imaging.hex_to_rgb(options.get("bg") or "#F7F4F0"),
+                    "bg": imaging.hex_to_rgb(options.get("bg") or design.get("background") or "#F7F4F0"),
                     "text_color": imaging.hex_to_rgb(options.get("text_color") or "#FFFFFF"),
                     "photo_mode": "cover",
+                    "photo_zoom": float(options.get("cover_photo_zoom", 1) or 1) * float(design.get("productScale", 1) or 1),
+                    "photo_x": options.get("cover_photo_x", 0),
+                    "photo_y": options.get("cover_photo_y", 0),
                     "show_text": True,
                     "color_items": [],
                     "whiten": False,
@@ -787,7 +1035,12 @@ def render_sku(task_id: str, options: dict | None = None, meta: dict | None = No
             photo = imaging.whiten_background(photo)
         canvas = Image.new("RGB", (width, height), bg)
         padding = int(min(width, height) * 0.085)
-        fitted = imaging.fit_contain(photo, (width, height), bg=bg, padding=padding)
+        fitted = imaging.fit_contain_focus(
+            photo, (width, height), bg=bg, padding=padding,
+            zoom=options.get("photo_zoom", 1),
+            offset_x=options.get("photo_x", 0),
+            offset_y=options.get("photo_y", 0),
+        )
         canvas.paste(fitted, (0, 0))
         draw = _draw(canvas)
         if options.get("show_name", True) and name:
@@ -852,6 +1105,9 @@ def render_white(task_id: str, options: dict | None = None, meta: dict | None = 
             "bg": (255, 255, 255),
             "text_color": (0, 0, 0),
             "photo_mode": "contain",
+            "photo_zoom": options.get("photo_zoom", 1),
+            "photo_x": options.get("photo_x", 0),
+            "photo_y": options.get("photo_y", 0),
             "show_text": False,
             "color_items": [],
             "whiten": bool(options.get("whiten", True)),
@@ -913,6 +1169,9 @@ def render_color_preview(task_id: str, options: dict | None = None, meta: dict |
             "bg": imaging.hex_to_rgb(options.get("bg") or "#F7F4F0"),
             "text_color": imaging.hex_to_rgb(options.get("text_color") or "#1A1A1A"),
             "photo_mode": str(options.get("photo_mode") or "cover"),
+            "photo_zoom": options.get("photo_zoom", 1),
+            "photo_x": options.get("photo_x", 0),
+            "photo_y": options.get("photo_y", 0),
             "show_text": template_id != "white",
             "color_items": color_items,
             "whiten": True,

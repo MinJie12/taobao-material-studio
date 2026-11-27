@@ -62,8 +62,12 @@
   },
   "ai": {
     "enabled": false,
+    "provider": "ollama",
+    "ollama_url": "http://127.0.0.1:11434",
     "base_url": "",
     "api_key": "",
-    "vision_model": ""
+    "text_model": "",
+    "vision_model": "",
+    "timeout": 20
   }
 }

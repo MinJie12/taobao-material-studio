@@ -8,9 +8,7 @@ import copy
 import hashlib
 import io
 import mimetypes
-import numpy as np
 import os
-import shutil
 import socket
 import sys
 import tempfile
@@ -19,11 +17,11 @@ import traceback
 import webbrowser
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from PIL import Image
 from werkzeug.exceptions import HTTPException
 
-from core import collector, config, exporter, imaging, keywords, storage, templates
+from core import ai, collector, config, exporter, imaging, keywords, main_design, storage, templates
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -69,6 +67,46 @@ def handle_exception(exc):
 @app.route("/")
 def index():
     return send_from_directory(str(config.WEB_DIR), "index.html")
+
+
+@app.route("/studio/<task_id>/<kind>/<int:slot>")
+def main_image_studio(task_id: str, kind: str, slot: int):
+    return send_from_directory(str(config.WEB_DIR), "studio.html")
+
+
+@app.route("/api/tasks/<task_id>/main-design/<kind>/<int:slot>", methods=["GET", "POST"])
+def main_image_design(task_id: str, kind: str, slot: int):
+    try:
+        meta = storage.load_meta(task_id)
+        record = main_design.get_record(meta, kind, slot)
+        if request.method == "POST":
+            data = json_body()
+            expected = data.get("revision", "")
+            if data.get("action") == "prepare":
+                record = templates.prepare_main_design(task_id, kind, slot, expected)
+            elif data.get("action") == "template-preview":
+                project = templates.prepare_main_design(task_id, kind, slot, expected, template_only=True)
+                return ok(project)
+            elif data.get("action") == "preview-layer":
+                image = main_design.preview(task_id, kind, slot, expected, data.get("layer"), data.get("change"),
+                                            from_template=data.get("fromTemplate") is True)
+                buffer = io.BytesIO()
+                image.save(buffer, format="PNG")
+                buffer.seek(0)
+                return send_file(buffer, mimetype="image/png", max_age=0)
+            else:
+                record = main_design.save(task_id, kind, slot, expected, data.get("layers"), data.get("order"), data.get("removed"),
+                                          from_template=data.get("fromTemplate") is True)
+    except FileNotFoundError as exc:
+        return fail(str(exc), 404)
+    except main_design.DesignConflict as exc:
+        return fail(str(exc), 409)
+    except (ValueError, KeyError) as exc:
+        return fail(str(exc))
+    return ok({
+        "title": meta.get("title", ""), "record": main_design.editable_record(record),
+        "revision": main_design.revision(record), "library": main_design.library(task_id),
+    })
 
 
 @app.route("/api/health")
@@ -129,6 +167,11 @@ def post_settings():
 @app.route("/api/templates")
 def get_templates():
     return ok(config.load_templates())
+
+
+@app.route("/api/ai/status")
+def ai_status():
+    return ok(ai.status(config.load_settings().get("ai", {})))
 
 
 @app.route("/api/tasks")
@@ -299,6 +342,129 @@ def get_task(task_id: str):
     })
 
 
+@app.route("/api/tasks/<task_id>/design", methods=["GET"])
+def get_design(task_id: str):
+    meta, error = _task_or_error(task_id)
+    if error:
+        return error
+    return ok({"design": meta.get("design", {}), "versions": meta.get("designVersions", [])})
+
+
+@app.route("/api/tasks/<task_id>/design", methods=["POST"])
+def save_design(task_id: str):
+    meta, error = _task_or_error(task_id)
+    if error:
+        return error
+    data = json_body()
+    design = data.get("design")
+    if not isinstance(design, dict):
+        return fail("design 必须是对象")
+    current = meta.get("design") if isinstance(meta.get("design"), dict) else {}
+    versions = list(meta.get("designVersions") or [])
+    versions.append({"design": current, "at": storage.now(), "note": str(data.get("note") or "")[:120]})
+    versions = versions[-30:]
+    meta["design"] = design
+    meta["designVersions"] = versions
+    storage.add_log(meta, "保存可编辑设计工程")
+    storage.save_meta(task_id, meta)
+    return ok({"design": design, "versions": versions})
+
+
+@app.route("/api/tasks/<task_id>/ai/analyze", methods=["POST"])
+def ai_analyze(task_id: str):
+    meta, error = _task_or_error(task_id)
+    if error:
+        return error
+    result = ai.analyze_product(meta, storage.scan_raw(task_id))
+    settings = config.load_settings().get("ai", {})
+    if settings.get("enabled"):
+        prompt = (
+            "请只返回简短的商品卖点和视觉风格建议，不要虚构材质、尺寸或功能。"
+            f"商品标题：{meta.get('title', '')}\n商品类目：{meta.get('category', '')}"
+        )
+        model_text = ai.complete(prompt, settings)
+        if model_text:
+            result["modelInsight"] = model_text[:4000]
+            result["source"] = "model+local-rule"
+
+    def _update(meta_obj):
+        meta_obj["aiAnalysis"] = result
+        storage.add_log(meta_obj, "完成商品本地分析")
+        return meta_obj
+
+    storage.update_meta(task_id, _update)
+    return ok(result)
+
+
+@app.route("/api/tasks/<task_id>/ai/assistant/preview", methods=["POST"])
+def ai_assistant_preview(task_id: str):
+    _, error = _task_or_error(task_id)
+    if error:
+        return error
+    instruction = str(json_body().get("instruction") or "").strip()
+    if not instruction:
+        return fail("请输入要修改的设计要求")
+    return ok(ai.parse_instruction(instruction))
+
+
+@app.route("/api/tasks/<task_id>/ai/assistant/apply", methods=["POST"])
+def ai_assistant_apply(task_id: str):
+    meta, error = _task_or_error(task_id)
+    if error:
+        return error
+    data = json_body()
+    plan = data.get("plan") if isinstance(data.get("plan"), dict) else ai.parse_instruction(str(data.get("instruction") or ""))
+    if not plan.get("operations"):
+        return fail("没有可应用的设计修改")
+    updated = ai.apply_instruction(meta, plan)
+    versions = list(meta.get("designVersions") or [])
+    versions.append({"design": dict(meta.get("design") or {}), "at": storage.now(), "note": "AI 设计修改前"})
+    updated["designVersions"] = versions[-30:]
+    history = list(meta.get("aiHistory") or [])
+    history.append({"before": {"design": dict(meta.get("design") or {})}, "plan": plan, "at": storage.now()})
+    updated["aiHistory"] = history
+    updated["aiRedoHistory"] = []
+    storage.save_meta(task_id, updated)
+    return ok({"design": updated.get("design", {}), "history": updated["aiHistory"]})
+
+
+@app.route("/api/tasks/<task_id>/ai/assistant/undo", methods=["POST"])
+def ai_assistant_undo(task_id: str):
+    meta, error = _task_or_error(task_id)
+    if error:
+        return error
+    history = list(meta.get("aiHistory") or [])
+    if not history:
+        return fail("没有可撤销的设计修改")
+    entry = history.pop()
+    redo = list(meta.get("aiRedoHistory") or [])
+    redo.append({"design": dict(meta.get("design") or {}), "entry": entry})
+    meta["design"] = dict((entry.get("before") or {}).get("design") or {})
+    meta["aiHistory"] = history
+    meta["aiRedoHistory"] = redo
+    storage.save_meta(task_id, meta)
+    return ok({"design": meta["design"], "history": history, "canRedo": True})
+
+
+@app.route("/api/tasks/<task_id>/ai/assistant/redo", methods=["POST"])
+def ai_assistant_redo(task_id: str):
+    meta, error = _task_or_error(task_id)
+    if error:
+        return error
+    redo = list(meta.get("aiRedoHistory") or [])
+    if not redo:
+        return fail("没有可重做的设计修改")
+    item = redo.pop()
+    entry = item.get("entry") or {}
+    history = list(meta.get("aiHistory") or [])
+    history.append(entry)
+    meta["design"] = dict(item.get("design") or {})
+    meta["aiHistory"] = history
+    meta["aiRedoHistory"] = redo
+    storage.save_meta(task_id, meta)
+    return ok({"design": meta["design"], "history": history, "canRedo": bool(redo)})
+
+
 @app.route("/api/tasks/<task_id>", methods=["DELETE"])
 def delete_task(task_id: str):
     _, error = _task_or_error(task_id)
@@ -339,10 +505,45 @@ def upload_images(task_id: str):
         except Exception as exc:
             return fail(f"{upload.filename}: {exc}")
     meta = storage.load_meta(task_id)
+    meta.setdefault("raw", {}).setdefault(kind, []).extend(saved)
     meta = collector.refresh_meta_from_files(task_id, meta)
     storage.add_log(meta, f"上传 {kind} 图片 {len(saved)} 张")
     storage.save_meta(task_id, meta)
     return ok({"saved": len(saved), "files": [item["file"] for item in saved]})
+
+
+@app.route("/api/tasks/<task_id>/raw/classify", methods=["POST"])
+def classify_review_image(task_id: str):
+    _, error = _task_or_error(task_id)
+    if error:
+        return error
+    data = json_body()
+    try:
+        record = storage.classify_review_file(
+            task_id,
+            str(data.get("file") or ""),
+            str(data.get("kind") or ""),
+            str(data.get("name") or "").strip(),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        return fail(str(exc))
+    return ok({"file": record["file"], "kind": data.get("kind")})
+
+
+@app.route("/api/tasks/<task_id>/raw", methods=["DELETE"])
+def delete_raw_image(task_id: str):
+    _, error = _task_or_error(task_id)
+    if error:
+        return error
+    data = json_body()
+    try:
+        record = storage.delete_raw_file(task_id, str(data.get("file") or ""))
+    except FileNotFoundError as exc:
+        return fail(str(exc), 404)
+    except ValueError as exc:
+        return fail(str(exc))
+    meta = collector.refresh_meta_from_files(task_id)
+    return ok({"file": record["file"], "kind": record["kind"], "raw": meta["raw"]})
 
 
 @app.route("/api/tasks/<task_id>/open-folder", methods=["POST"])
@@ -464,11 +665,26 @@ def analyze_keywords(task_id: str):
     if not titles:
         text = str(data.get("text") or "")
         titles = [line.strip() for line in text.splitlines() if line.strip()]
+    if not isinstance(titles, list):
+        return fail("竞品标题应为列表或每行一条的文本")
+    titles = [str(title).strip()[:300] for title in titles[:300] if str(title).strip()]
     product_title = str(data.get("productTitle") or meta.get("title", ""))
+    new_product = data.get("newProduct") is True
+    if new_product:
+        product_title = str(data.get("productTitle") or "").strip()[:300]
+        if not product_title:
+            return fail("请填写自定义商品标题")
     image_tags = data.get("imageTags") or meta.get("keywords", {}).get("imageTags") or {}
     color_tags = keywords.analyze_task_colors(task_id, storage.scan_raw(task_id))
     analysis = keywords.analyze(list(titles or []), product_title, image_tags, color_tags)
     analysis["colorTags"] = color_tags
+    if new_product:
+        facts = str(data.get("titleFacts") or "")[:800]
+        preferred = data.get("words")
+        analysis["titles"] = keywords.recommend_new_titles(
+            product_title, list(titles or []), facts,
+            [word for word in preferred if isinstance(word, str)] if isinstance(preferred, list) else None,
+        )
 
     def _update(meta_obj):
         store = meta_obj.setdefault("keywords", {})
@@ -484,6 +700,10 @@ def analyze_keywords(task_id: str):
             "brandFound": analysis.get("brandFound", []),
             "stats": analysis.get("stats", {}),
         })
+        if new_product:
+            store["titleFacts"] = facts
+            if store.get("selectedTitle") not in {item["title"] for item in analysis["titles"]}:
+                store["selectedTitle"] = ""
         storage.add_log(meta_obj, f"关键词分析完成：{len(titles or [])} 条竞品标题")
         return meta_obj
 
@@ -517,10 +737,18 @@ def save_keywords(task_id: str):
     if error:
         return error
     data = json_body()
+    if "titles" in data:
+        if not isinstance(data["titles"], list) or any(
+                not isinstance(item, dict) or not isinstance(item.get("title"), str) for item in data["titles"]):
+            return fail("标题候选格式无效")
+        if any(len(item["title"]) > keywords.NEW_TITLE_LIMIT for item in data["titles"]):
+            return fail("请将超长标题调整为 30 字以内")
+        for item in data["titles"]:
+            item["length"] = len(item["title"])
 
     def _update(meta_obj):
         store = meta_obj.setdefault("keywords", {})
-        for key in ("imageTags", "titles", "selectedTitle", "competitorTitles", "productTitle"):
+        for key in ("imageTags", "titles", "selectedTitle", "competitorTitles", "productTitle", "titleFacts"):
             if key in data:
                 store[key] = data[key]
         storage.add_log(meta_obj, "关键词与标题已保存")
@@ -540,8 +768,11 @@ def edit_image(task_id: str):
     rel = str(data.get("file") or "").strip()
     data_url = str(data.get("dataUrl") or "").strip()
     save_as_new = bool(data.get("saveAsNew"))
-    if not rel.startswith("output/"):
-        return fail("只能编辑成品图，不能修改原图")
+    note = storage.safe_filename(str(data.get("note") or "").strip(), "", 24)
+    is_raw = rel.startswith("raw/")
+    is_output = rel.startswith("output/")
+    if not (is_raw or is_output):
+        return fail("只能编辑原始素材或成品图")
     if not data_url.startswith("data:image/"):
         return fail("图片数据格式错误")
     try:
@@ -560,20 +791,36 @@ def edit_image(task_id: str):
     except Exception as exc:
         return fail(f"图片数据无法读取: {exc}")
     extension = ".png" if use_png else ".jpg"
-    target = path
-    if save_as_new:
-        target = path.with_name(f"{path.stem}_edited{extension}")
-        index = 2
+    labels = {
+        "main_pc": "主图PC",
+        "main_mobile": "主图手机",
+        "white": "白底图",
+        "detail": "详情图",
+        "sku": "SKU图",
+        "edited": "编辑图",
+        "main": "主图原图",
+        "review": "待确认原图",
+    }
+    parts = Path(rel).parts
+    kind = parts[1] if len(parts) > 1 else ""
+    label = labels.get(kind, "图片")
+    stem = Path(rel).stem
+    if kind and stem.startswith(kind + "_"):
+        stem = stem[len(kind) + 1:]
+    stem = storage.safe_filename(stem, "image", 36)
+    name_parts = [label, stem]
+    if note:
+        name_parts.append(note)
+    edited_dir = task_dir / "output" / "edited"
+    edited_dir.mkdir(parents=True, exist_ok=True)
+    overwrite_edited = is_output and not save_as_new and path.parent.name == "edited"
+    target = path if overwrite_edited else edited_dir / f"{'_'.join(name_parts)}_edited{extension}"
+    if not overwrite_edited and (save_as_new or is_raw):
+        index = 1
+        base = target
         while target.exists():
-            target = path.with_name(f"{path.stem}_edited_{index}{extension}")
             index += 1
-    else:
-        backup_dir = task_dir / "output" / ".backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        backup = backup_dir / f"{storage.timestamp_slug()}_{path.name}"
-        shutil.copy2(path, backup)
-        if use_png and target.suffix.lower() in (".jpg", ".jpeg"):
-            target = target.with_suffix(".png")
+            target = base.with_name(f"{base.stem}_{index}{base.suffix}")
     if use_png:
         image.save(target, "PNG", optimize=True)
     else:
@@ -585,8 +832,22 @@ def edit_image(task_id: str):
         "bytes": target.stat().st_size,
         "issues": [],
         "editedAt": storage.now(),
+        "originFile": rel,
+        "note": note,
     }
-    storage.update_output_record(task_id, rel, info)
+    if is_output and not save_as_new:
+        storage.update_output_record(task_id, rel, info)
+    else:
+        def _append(meta_obj: dict):
+            edited = meta_obj.setdefault("outputs", {}).setdefault("edited", [])
+            if not isinstance(edited, list):
+                edited = list(edited.values()) if isinstance(edited, dict) else []
+                meta_obj["outputs"]["edited"] = edited
+            edited.append(info)
+            storage.add_log(meta_obj, f"保存编辑图片：{info['file']}")
+            return meta_obj
+
+        storage.update_meta(task_id, _append)
     return ok(info)
 
 
@@ -608,25 +869,10 @@ def remove_background(task_id: str):
         return fail("图片文件不存在", 404)
     try:
         with Image.open(path) as opened:
-            source = opened.convert("RGB")
+            source = opened.convert("RGBA")
     except Exception as exc:
         return fail(f"图片无法读取: {exc}")
-    width, height = source.size
-    arr = np.asarray(source).astype(np.int16)
-    border = np.concatenate([
-        arr[:3, :, :].reshape(-1, 3),
-        arr[-3:, :, :].reshape(-1, 3),
-        arr[:, :3, :].reshape(-1, 3),
-        arr[:, -3:, :].reshape(-1, 3),
-    ], axis=0)
-    background = np.median(border, axis=0)
-    distance = np.sqrt(np.sum((arr - background) ** 2, axis=2))
-    low = float(tolerance)
-    high = float(tolerance) * 1.8
-    alpha = np.clip((distance - low) / max(1.0, high - low), 0, 1)
-    alpha = (alpha * 255).astype(np.uint8)
-    rgba = np.dstack([arr.astype(np.uint8), alpha])
-    cutout = Image.fromarray(rgba, "RGBA")
+    cutout, background = imaging.remove_edge_background(source, tolerance)
     out_dir = task_dir / "output" / "cutout"
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / f"{storage.timestamp_slug()}_{Path(rel).stem}_cutout.png"
@@ -634,7 +880,7 @@ def remove_background(task_id: str):
     return ok({
         "file": target.relative_to(task_dir).as_posix(),
         "method": "color-distance",
-        "background": [int(value) for value in background],
+        "background": background,
     })
 
 

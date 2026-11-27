@@ -22,8 +22,9 @@ _META_LOCK = threading.RLock()
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".jfif", ".tif", ".tiff"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".flv", ".mkv"}
 ALLOWED_RAW_EXTS = IMAGE_EXTS | VIDEO_EXTS
-RAW_KINDS = ("main", "detail", "sku", "video")
-OUTPUT_KINDS = ("main_pc", "main_mobile", "white", "detail", "sku", "video", "export")
+RAW_KINDS = ("main", "detail", "sku", "video", "review")
+OUTPUT_KINDS = ("main_pc", "main_mobile", "white", "detail", "sku", "video", "edited", "export")
+OUTPUT_LIST_KINDS = ("edited",)
 
 _WINDOWS_BAD = re.compile(r'[\\/:*?"<>|\r\n\t]+')
 
@@ -94,7 +95,11 @@ def _default_meta(task_id: str, offer_id: str, title: str, source_url: str) -> d
         "raw": {kind: [] for kind in RAW_KINDS},
         "sku": [],
         "skuProps": [],
-        "outputs": {kind: {} for kind in OUTPUT_KINDS if kind != "export"},
+        "outputs": {
+            kind: ([] if kind in OUTPUT_LIST_KINDS else {})
+            for kind in OUTPUT_KINDS
+            if kind != "export"
+        },
         "exports": [],
         "keywords": {
             "competitorTitles": [],
@@ -107,6 +112,17 @@ def _default_meta(task_id: str, offer_id: str, title: str, source_url: str) -> d
             "brandFound": [],
             "stats": {},
         },
+        "design": {
+            "canvas": {"width": 800, "height": 800},
+            "style": "minimal",
+            "background": "#F7F4F0",
+            "productScale": 1,
+            "typographyUnified": False,
+            "layers": [],
+        },
+        "designVersions": [],
+        "aiHistory": [],
+        "aiRedoHistory": [],
         "logs": [],
     }
 
@@ -129,7 +145,13 @@ def _normalize_meta(meta: dict) -> dict:
         raw.setdefault(kind, [])
     outputs = meta.setdefault("outputs", {})
     for kind in OUTPUT_KINDS:
-        if kind != "export":
+        if kind == "export":
+            continue
+        if kind in OUTPUT_LIST_KINDS:
+            value = outputs.get(kind)
+            if not isinstance(value, list):
+                outputs[kind] = list(value.values()) if isinstance(value, dict) else []
+        else:
             outputs.setdefault(kind, {})
     meta.setdefault("sku", [])
     meta.setdefault("exports", [])
@@ -323,6 +345,79 @@ def save_upload(task_id: str, kind: str, filename: str, stream, name: str = "", 
     return file_record(dest, task_dir, url=url, name=name or Path(filename).stem)
 
 
+def classify_review_file(task_id: str, rel: str, target_kind: str, name: str = "") -> dict:
+    if target_kind not in ("main", "detail", "sku"):
+        raise ValueError("待确认素材只能归类为主图、详情图或 SKU 图")
+    task_dir = task_path(task_id)
+    review_dir = (task_dir / "raw" / "review").resolve()
+    source = (task_dir / str(rel)).resolve()
+    if source.parent != review_dir or not source.is_file():
+        raise ValueError("待确认素材路径无效")
+    if source.suffix.lower() not in IMAGE_EXTS:
+        raise ValueError("待确认素材不是图片")
+
+    meta = load_meta(task_id)
+    source_record = next(
+        (item for item in meta.get("raw", {}).get("review", []) if item.get("file") == rel),
+        {},
+    )
+    target_dir = task_dir / "raw" / target_kind
+    target_dir.mkdir(parents=True, exist_ok=True)
+    index = _next_index(target_dir, target_kind)
+    record_name = name or source_record.get("name", "") or source.stem
+    sku_label = safe_filename(record_name) if target_kind == "sku" else ""
+    while True:
+        filename = f"{target_kind}_{index:02d}{'_' + sku_label if sku_label else ''}{source.suffix.lower()}"
+        destination = target_dir / filename
+        if not destination.exists():
+            break
+        index += 1
+
+    source.rename(destination)
+    record = file_record(
+        destination,
+        task_dir,
+        url=source_record.get("url", ""),
+        name=record_name,
+    )
+    meta.setdefault("raw", {}).setdefault("review", [])
+    meta["raw"]["review"] = [item for item in meta["raw"]["review"] if item.get("file") != rel]
+    meta["raw"].setdefault(target_kind, []).append(record)
+    if target_kind == "sku":
+        meta["sku"] = rebuild_sku_from_files(task_id)
+    add_log(meta, f"待确认素材已归类为 {target_kind}：{destination.name}")
+    meta = save_meta(task_id, meta)
+    write_task_aux(task_id, meta)
+    return record
+
+
+def delete_raw_file(task_id: str, rel: str) -> dict:
+    task_dir = task_path(task_id)
+    raw_root = (task_dir / "raw").resolve()
+    source = (task_dir / str(rel)).resolve()
+    kind = source.parent.name
+    if kind not in RAW_KINDS or source.parent.parent != raw_root or not source.is_file():
+        raise ValueError("原始素材路径无效")
+    relative = source.relative_to(task_dir).as_posix()
+    if Path(str(rel)).as_posix() != relative or source.suffix.lower() not in ALLOWED_RAW_EXTS:
+        raise ValueError("原始素材路径无效")
+
+    with _META_LOCK:
+        meta = load_meta(task_id)
+        source.unlink()
+        meta.setdefault("raw", {}).setdefault(kind, [])
+        meta["raw"][kind] = [
+            item for item in meta["raw"][kind]
+            if item.get("file") != relative
+        ]
+        if kind == "sku":
+            meta["sku"] = rebuild_sku_from_files(task_id)
+        add_log(meta, f"已删除 {kind} 原始素材：{source.name}", "warn")
+        save_meta(task_id, meta)
+        write_task_aux(task_id, meta)
+    return {"file": relative, "kind": kind}
+
+
 def scan_raw(task_id: str) -> dict[str, list[str]]:
     task_dir = task_path(task_id)
     result: dict[str, list[str]] = {}
@@ -356,13 +451,13 @@ def scan_outputs(task_id: str) -> dict[str, list[str]]:
 def get_cover(task_id: str, meta: dict | None = None) -> str:
     meta = meta or load_meta(task_id)
     raw = meta.get("raw", {})
-    for kind in ("main", "detail", "sku"):
+    for kind in ("main", "detail", "sku", "review"):
         for record in raw.get(kind, []):
             rel = record.get("file", "")
             if rel and (task_path(task_id) / rel).is_file():
                 return rel
     groups = scan_raw(task_id)
-    for kind in ("main", "detail", "sku"):
+    for kind in ("main", "detail", "sku", "review"):
         if groups.get(kind):
             return groups[kind][0]
     return ""

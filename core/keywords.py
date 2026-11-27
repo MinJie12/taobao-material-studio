@@ -438,6 +438,109 @@ def generate_titles_from_words(words: list[str], product_title: str = "", count:
     return base["titles"]
 
 
+NEW_TITLE_LIMIT = 30
+NEW_TITLE_COUNT = 5
+
+
+def recommend_new_titles(product_title: str, competitors: list[str], facts: str = "", preferred: list[str] | None = None) -> list[dict]:
+    """Rank confirmed phrases using competitor wording, then combine within the length limit."""
+    engine = get_engine()
+    ignored = {"新品", "新款", "新上市", "新品上市", "上新"}
+    original = re.findall(r"[\w%+.-]+", product_title.strip())[:32]
+    title_words = []
+    anchors = set()
+    for phrase in original:
+        # Keep negated claims and numeric specifications together.
+        parts = engine.jieba.lcut(phrase) if engine.jieba and not re.search(r"[不无非未\d]", phrase) else [phrase]
+        core_index = next((index for index, part in enumerate(parts)
+                           if engine.term_category.get(engine.term_by_lower.get(part.casefold(), "")) == "core"), None)
+        if core_index is not None:
+            prefix = parts[:core_index + 1]
+            # Keep a short product phrase together, excluding marketing words.
+            product = "".join(prefix)
+            banned, brands = set(), set()
+            engine.scan_banned_brands(product, banned, brands)
+            if len(product) <= 18 and not banned and not brands and not any(part in ignored for part in prefix):
+                anchors.add(product.casefold())
+                parts = [product, *parts[core_index + 1:]]
+        title_words.extend(parts)
+    if not anchors and not any(engine.term_category.get(engine.term_by_lower.get(word.casefold(), "")) == "core"
+                               for word in title_words):
+        # Preserve names of products outside the built-in category dictionary.
+        title_words = original if any(len(phrase) <= NEW_TITLE_LIMIT for phrase in original) else title_words
+    fact_words = [part.strip() for part in re.split(r"[,，、;；\n]+", facts) if part.strip()]
+    competitors = list(dict.fromkeys(title.casefold().strip() for title in competitors if title.strip()))[:300]
+    preferred = {word.casefold() for word in (preferred or [])}
+    words = {}
+    for word in [*title_words, *fact_words]:
+        word = word.strip()
+        key = word.casefold()
+        if key in words or key in ignored or not 1 <= len(word) <= NEW_TITLE_LIMIT:
+            continue
+        if not re.search(r"[^\W_]", word) or word in engine.stopwords:
+            continue
+        banned, brands = set(), set()
+        engine.scan_banned_brands(word, banned, brands)
+        if banned or brands:
+            continue
+        category = "core" if key in anchors else engine.term_category.get(engine.term_by_lower.get(key, ""), "other")
+        if len(word) == 1 and word not in ("女", "男", "童") and category == "other":
+            continue
+        pattern = re.escape(key)
+        if key.isascii():
+            pattern = rf"(?<![a-z0-9]){pattern}(?![a-z0-9])"
+        match = re.compile(pattern)
+        hits = sum(bool(match.search(title)) for title in competitors)
+        words[key] = (word, category, hits, key in preferred)
+        if len(words) == 40:
+            break
+    terms = list(words.values())
+    if not terms:
+        return []
+    anchor = next((term[0] for term in terms if term[1] == "core"), terms[0][0])
+    profiles = [
+        ("核心搜索", ("core", "style", "selling", "scene", "detail")),
+        ("卖点优先", ("selling", "core", "detail", "style", "scene")),
+        ("场景优先", ("scene", "style", "core", "selling", "detail")),
+        ("细节优先", ("detail", "core", "selling", "style", "scene")),
+        ("风格优先", ("style", "core", "scene", "detail", "selling")),
+    ]
+    results = []
+    seen = set()
+    for label, order in profiles[:NEW_TITLE_COUNT]:
+        priorities = {category: len(order) - index for index, category in enumerate(order)}
+        ordered = sorted(terms, key=lambda term: -priorities.get(term[1], 0))
+        # Keep several alternatives per length and anchor-presence state.
+        combinations = {(0, False): [(0, ())]}
+        for word, category, hits, picked in ordered:
+            for (length, anchored), candidates in list(combinations.items()):
+                for score, parts in candidates:
+                    separator = " " if parts and re.search(r"[a-z0-9]$", parts[-1], re.I) and re.match(r"[a-z0-9]", word, re.I) else ""
+                    size = length + len(separator) + len(word)
+                    if size > NEW_TITLE_LIMIT or any(word.casefold() in part.strip().casefold()
+                                                     or part.strip().casefold() in word.casefold() for part in parts):
+                        continue
+                    key = (size, anchored or word == anchor)
+                    weight = 2 + priorities.get(category, 0) + min(6, hits) * 2 + int(picked) * 3
+                    choices = combinations.get(key, []) + [(score + weight, (*parts, separator + word))]
+                    combinations[key] = sorted(choices, reverse=True)[:8]
+        ranked = sorted(
+            ((length, score, parts) for (length, anchored), candidates in combinations.items() if anchored
+             for score, parts in candidates), reverse=True,
+        )
+        for length, score, parts in ranked:
+            title = "".join(parts)
+            key = title.replace(" ", "").casefold()
+            banned, brands = set(), set()
+            engine.scan_banned_brands(title, banned, brands)
+            if key in seen or banned or brands:
+                continue
+            seen.add(key)
+            results.append({"title": title, "length": length, "source": label, "words": [part.strip() for part in parts]})
+            break
+    return results
+
+
 def suggest_copy(analysis: dict) -> dict:
     top = lambda key, n: top_words(analysis, key, n)
     core = top("core", 2)

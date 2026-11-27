@@ -9,7 +9,9 @@ import tempfile
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from PIL import Image
@@ -27,12 +29,31 @@ RISK_MARKERS = (
     "访问被拒绝",
 )
 
-MAIN_KEYS = ("offerimg", "mainimg", "mainpic", "mainimage", "mainpiclist", "mainimages", "offerimagelist")
-DETAIL_KEYS = ("detail", "desc", "description", "content", "detailimage", "descimage")
+# 只有出现这些商品数据结构，才认为页面可用于采集
+PRODUCT_DATA_MARKERS = (
+    "offerimglist",
+    "offer_details",
+    "skuimages",
+    "skuprops",
+    "offerinfomodel",
+    "offerimages",
+    "window.context",
+)
+
+MAIN_KEYS = ("offerimg", "offerimage", "mainimg", "mainpic", "mainimage", "mainpiclist", "mainimages", "offerimagelist")
+DETAIL_KEYS = ("detail", "desc", "description", "detailimage", "descimage")
 SKU_KEYS = ("sku", "spec", "color")
 VIDEO_KEYS = ("video", "mainvideo", "detailvideo", "videourl")
+DETAIL_RESOURCE_KEYS = ("detailurl", "descurl", "descriptionurl", "detailresourceurl")
+DETAIL_HOSTS = ("1688.com", "alicdn.com", "tbcdn.cn", "tmall.com", "taobao.com")
 IMAGE_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp|gif|bmp|avif|jfif|tif|tiff)(\?|$)", re.I)
 VIDEO_EXT_RE = re.compile(r"\.(mp4|mov|m4v|webm|avi|flv|mkv)(\?|$)", re.I)
+# 缩略图变体与站点 UI 图标，不应作为商品素材下载
+THUMBNAIL_VARIANT_RE = re.compile(r"\.(?:search|summ|\d{1,3}x\d{1,3})\.(?:jpe?g|png|webp|gif)$", re.I)
+TINY_ICON_RE = re.compile(r"-tps-(\d{1,4})-(\d{1,4})\.(?:jpe?g|png|webp|gif)$", re.I)
+NOISE_PATH_PARTS = ("/code/npm/", "/rax-pkg/", "/alilog/", "/tfs/")
+NOISE_EXTENSIONS = (".js", ".css", ".json", ".html", ".htm")
+IMAGE_CDN_HOSTS = ("alicdn.com", "tbcdn.cn", "tmall.com", "taobao.com")
 
 
 class CollectError(Exception):
@@ -105,6 +126,11 @@ def fetch_page(url: str, settings: dict, cookie: str = "", mobile: bool = False)
     return response.text
 
 
+def _has_product_data(html: str) -> bool:
+    lowered = str(html or "").lower()
+    return any(marker in lowered for marker in PRODUCT_DATA_MARKERS)
+
+
 def fetch_product_html(url: str, settings: dict, cookie: str = "") -> tuple[str, str]:
     url = normalize_url(url)
     if not url:
@@ -128,10 +154,7 @@ def fetch_product_html(url: str, settings: dict, cookie: str = "") -> tuple[str,
         if detect_risk(html):
             last_html = html
             continue
-        if len(html) > 4000 and any(
-            marker in html
-            for marker in ("__INIT_DATA__", "__NEXT_DATA__", "offer_details", "offerImgList", "cbu01.alicdn.com")
-        ):
+        if len(html) > 4000 and _has_product_data(html):
             return html, candidate
         if len(html) > len(last_html):
             last_html = html
@@ -140,9 +163,48 @@ def fetch_product_html(url: str, settings: dict, cookie: str = "") -> tuple[str,
             "1688 返回了风控验证页。请在浏览器登录 1688 后复制 Cookie 填入，"
             "或改用“导入网页文件 / 导入文件夹 / 手动上传”方式采集。"
         )
-    if not last_html:
+    if not last_html or last_html.startswith("请求失败"):
         raise CollectError("无法获取商品页面，请检查链接或网络")
-    return last_html, url
+    raise CollectError(
+        "1688 返回的页面中没有商品数据（可能是页面改版或临时风控）。"
+        "请稍后重试、填写 Cookie，或改用“导入网页文件 / 导入文件夹 / 手动上传”方式采集。"
+    )
+
+
+def _is_allowed_detail_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == domain or host.endswith("." + domain) for domain in DETAIL_HOSTS)
+
+
+def fetch_detail_resource(url: str, settings: dict, cookie: str = "", referer: str = "") -> tuple[str, str]:
+    if not _is_allowed_detail_url(url):
+        return "", "详情资源域名不在允许范围内"
+    headers = _headers(settings, cookie=cookie)
+    if referer:
+        headers["Referer"] = referer
+    try:
+        response = requests.get(url, headers=headers, timeout=int(settings.get("download", {}).get("timeout", 30)),
+                                allow_redirects=False, stream=True)
+    except requests.RequestException as exc:
+        return "", f"请求失败：{exc}"
+    if response.is_redirect:
+        response.close()
+        return "", "详情资源返回了重定向，未跟随"
+    if response.status_code != 200:
+        response.close()
+        return "", f"HTTP {response.status_code}"
+    chunks = []
+    total = 0
+    encoding = response.encoding or "utf-8"
+    try:
+        for chunk in response.iter_content(64 * 1024):
+            total += len(chunk)
+            if total > 8 * 1024 * 1024:
+                return "", "详情资源超过 8 MB 限制"
+            chunks.append(chunk)
+    finally:
+        response.close()
+    return b"".join(chunks).decode(encoding, errors="replace"), ""
 
 
 def mobile_index(index: int) -> bool:
@@ -152,13 +214,17 @@ def mobile_index(index: int) -> bool:
 def iter_json_blobs(text: str):
     text = str(text or "")
     patterns = (
-        r"window\.__INIT_DATA__\s*=\s*",
-        r"window\.__GLOBAL_DATA__\s*=\s*",
-        r"window\.__NEXT_DATA__\s*=\s*",
-        r"window\.__PRELOADED_STATE__\s*=\s*",
-        r"window\.__INITIAL_STATE__\s*=\s*",
+        r"window\.context\s*=\s*",
+        r"window\.context\s*=\s*window\.context\s*\|\|\s*",
+        r"window\.context\.result\s*=\s*",
+        r"window\.__INIT_DATA_*\s*=\s*",
+        r"window\.__GLOBAL_DATA_*\s*=\s*",
+        r"window\.__GLOBAL_DADA\s*=\s*",
+        r"window\.__NEXT_DATA_*\s*=\s*",
+        r"window\.__PRELOADED_STATE_*\s*=\s*",
+        r"window\.__INITIAL_STATE_*\s*=\s*",
         r"var\s+offer_details\s*=\s*",
-        r"window\.__DATA__\s*=\s*",
+        r"window\.__DATA_*\s*=\s*",
     )
     decoder = json.JSONDecoder()
     for pattern in patterns:
@@ -194,15 +260,43 @@ def _walk(obj, path=()):
         yield obj, path
 
 
+def _is_noise_image(url: str) -> bool:
+    """过滤 CDN 上的前端脚本、UI 图标和缩略图变体。"""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    if host.startswith(("g.", "g-")) or "code/npm" in path:
+        return True
+    if any(part in path for part in NOISE_PATH_PARTS):
+        return True
+    if path.endswith(NOISE_EXTENSIONS):
+        return True
+    if THUMBNAIL_VARIANT_RE.search(path):
+        return True
+    match = TINY_ICON_RE.search(path)
+    if match and min(int(match.group(1)), int(match.group(2))) <= 300:
+        return True
+    return False
+
+
 def _image_url(value) -> str:
     url = str(value or "").strip().replace("\\/", "/").replace("&amp;", "&")
     if url.startswith("//"):
         url = "https:" + url
     if not re.match(r"^https?://", url, re.I):
         return ""
-    if not (IMAGE_EXT_RE.search(url) or "alicdn.com" in url or "tbcdn.cn" in url):
+    if _is_noise_image(url):
         return ""
-    return url
+    if IMAGE_EXT_RE.search(url):
+        return url
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    # 部分 CDN 图片地址没有扩展名，仅接受明确的图片路径
+    if any(host == domain or host.endswith("." + domain) for domain in IMAGE_CDN_HOSTS):
+        if any(token in path for token in ("/img/", "/imgextra/", "/bao/uploaded/", "/kf/")):
+            return url
+    return ""
 
 
 def _video_url(value) -> str:
@@ -211,7 +305,11 @@ def _video_url(value) -> str:
         url = "https:" + url
     if not re.match(r"^https?://", url, re.I):
         return ""
-    if VIDEO_EXT_RE.search(url) or "video" in url.lower():
+    path = urlparse(url).path or ""
+    if VIDEO_EXT_RE.search(path) or VIDEO_EXT_RE.search(url):
+        return url
+    host = (urlparse(url).hostname or "").lower()
+    if "vod." in host or host.startswith("video."):
         return url
     return ""
 
@@ -226,12 +324,16 @@ def _classify(path: tuple[str, ...], url: str = "") -> str:
         return "detail"
     if any(key in joined for key in MAIN_KEYS):
         return "main"
+    if "globaldata" in joined and "images" in joined:
+        return "main"
     return "unknown"
 
 
 def _pick(data: dict, keys: tuple[str, ...], default=""):
+    keys_lower = {str(key).lower(): key for key in data}
     for key in keys:
-        value = data.get(key)
+        actual = key if key in data else keys_lower.get(key.lower())
+        value = data.get(actual) if actual is not None else None
         if value is not None and str(value).strip():
             return str(value).strip()
     return default
@@ -251,6 +353,7 @@ def _new_result() -> dict:
         "unknown": [],
         "skuProps": [],
         "skuMap": [],
+        "detailUrls": [],
         "detailText": "",
         "notes": [],
     }
@@ -261,7 +364,42 @@ def _append_unique(target: list, value: str) -> None:
         target.append(value)
 
 
-def parse_json_blob(obj, result: dict) -> None:
+def _add_sku_image(result: dict, url: str, name: str = "") -> None:
+    if not url:
+        return
+    for existing in result["sku"]:
+        if existing.get("url") == url:
+            if name and not existing.get("name"):
+                existing["name"] = name
+            return
+    for kind in ("main", "detail"):
+        if url in result[kind]:
+            return
+    result["unknown"] = [item for item in result["unknown"] if item != url]
+    result["sku"].append({"name": name, "url": url})
+
+
+def _add_image_candidate(result: dict, url: str, kind: str) -> None:
+    if not url:
+        return
+    if kind == "sku":
+        _add_sku_image(result, url)
+        return
+    for existing_kind in ("main", "detail", "sku"):
+        for item in result[existing_kind]:
+            existing_url = item.get("url", "") if isinstance(item, dict) else item
+            if existing_url == url:
+                return
+    result["unknown"] = [item for item in result["unknown"] if item != url]
+    if kind in ("main", "detail"):
+        _append_unique(result[kind], url)
+    else:
+        _append_unique(result["unknown"], url)
+
+
+def parse_json_blob(obj, result: dict, depth: int = 0) -> None:
+    if depth > 40:
+        return
     if isinstance(obj, dict):
         keys_lower = {str(key).lower(): key for key in obj.keys()}
         if not result.get("title"):
@@ -308,16 +446,14 @@ def parse_json_blob(obj, result: dict) -> None:
         if isinstance(sku_images, (list, tuple)):
             for item in sku_images:
                 if isinstance(item, str):
-                    _append_unique(result["sku"], {"name": "", "url": _image_url(item)})
+                    _add_sku_image(result, _image_url(item))
                     continue
                 if not isinstance(item, dict):
                     continue
                 name = _pick(item, ("name", "colorname", "valuename", "specname", "title", "value"), "")
                 url = _image_url(_pick(item, ("imgurl", "imageurl", "url", "src", "img", "picurl")))
                 if name or url:
-                    entry = {"name": name, "url": url}
-                    if entry not in result["sku"]:
-                        result["sku"].append(entry)
+                    _add_sku_image(result, url, name)
         sku_props = None
         for key in ("skuprops", "props", "skupropertys", "property"):
             if key in keys_lower:
@@ -340,7 +476,7 @@ def parse_json_blob(obj, result: dict) -> None:
                     if item not in result["skuProps"]:
                         result["skuProps"].append(item)
                     if image:
-                        _append_unique(result["sku"], {"name": value_name, "url": image})
+                        _add_sku_image(result, image, value_name)
         sku_map = obj.get(keys_lower.get("skuinfomap", "")) or obj.get(keys_lower.get("skumap", ""))
         if isinstance(sku_map, dict):
             for key, value in sku_map.items():
@@ -354,19 +490,83 @@ def parse_json_blob(obj, result: dict) -> None:
         for value, path in _walk(obj):
             if not isinstance(value, str):
                 continue
+            if any(part.lower() in DETAIL_RESOURCE_KEYS for part in path):
+                detail_url = value.strip()
+                if detail_url and len(detail_url) < 2048:
+                    _append_unique(result["detailUrls"], detail_url)
             url = _image_url(value)
             if url:
                 kind = _classify(path, url)
-                if kind in result:
-                    _append_unique(result[kind], url)
-                else:
-                    _append_unique(result["unknown"], url)
+                _add_image_candidate(result, url, kind)
             video = _video_url(value)
             if video:
                 _append_unique(result["video"], video)
+        for value in obj.values():
+            if isinstance(value, (dict, list)):
+                parse_json_blob(value, result, depth + 1)
     elif isinstance(obj, list):
         for item in obj:
-            parse_json_blob(item, result)
+            parse_json_blob(item, result, depth + 1)
+
+
+class _ProductImageMarkupParser(HTMLParser):
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+    MAIN_MARKERS = ("dt-tab", "detail-gallery-turn", "detail-gallery-img", "img-list-wrapper", "od-gallery-img", "od-scroller-item")
+    SKU_MARKERS = ("pc-sku-wrapper", "prop-item-inner-wrapper", "sku-item-wrapper", "specification-cell", "sku-filter-button", "expand-view-item", "feature-item")
+    DETAIL_MARKERS = ("de-description-detail", "detailcontentcontainer", "html-description", "desc-lazyload-container")
+
+    def __init__(self, result: dict):
+        super().__init__(convert_charrefs=True)
+        self.result = result
+        self.stack: list[tuple[str, dict[str, str]]] = []
+
+    def _context_kind(self, attrs: dict[str, str]) -> str:
+        values = [attrs.get("id", ""), attrs.get("class", "")]
+        values.extend(parent_attrs.get("id", "") + " " + parent_attrs.get("class", "") for _, parent_attrs in self.stack)
+        context = " ".join(values).lower()
+        if any(marker in context for marker in self.MAIN_MARKERS):
+            return "main"
+        if any(marker in context for marker in self.SKU_MARKERS):
+            return "sku"
+        if any(marker in context for marker in self.DETAIL_MARKERS):
+            return "detail"
+        return "unknown"
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = {key.lower(): value or "" for key, value in attrs}
+        kind = self._context_kind(attr_map)
+        candidates = [
+            attr_map.get(key, "")
+            for key in ("src", "data-src", "data-lazy-src", "data-lazyload-src", "data-ks-lazyload")
+        ]
+        candidates.extend(re.findall(r"url\(\s*['\"]?([^)'\" ]+)['\"]?\s*\)", attr_map.get("style", ""), re.I))
+        if tag.lower() in ("img", "source") or attr_map.get("style"):
+            for candidate in candidates:
+                _add_image_candidate(self.result, _image_url(candidate), kind)
+        if tag.lower() not in self.VOID_TAGS:
+            self.stack.append((tag.lower(), attr_map))
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                del self.stack[index:]
+                break
+
+
+def _normalize_detail_resource_url(value: str, base_url: str) -> str:
+    url = urljoin(base_url, str(value or "").strip().replace("\\/", "/"))
+    if not url.startswith(("http://", "https://")):
+        return ""
+    # 1688 会用 air.1688.com 的外壳页包裹真实详情资源，优先取内层直链
+    inner = parse_qs(urlparse(url).query).get("url", [""])[0]
+    if inner:
+        inner_url = urljoin(url, inner)
+        if inner_url.startswith(("http://", "https://")) and _is_allowed_detail_url(inner_url):
+            return inner_url
+    if _is_allowed_detail_url(url):
+        return url
+    return ""
 
 
 def parse_html(html: str, base_url: str = "") -> dict:
@@ -390,20 +590,22 @@ def parse_html(html: str, base_url: str = "") -> dict:
             result["title"] = title
     og_image = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html, re.I)
     if og_image:
-        _append_unique(result["main"], _image_url(og_image.group(1)))
-    for match in re.finditer(r'<img[^>]+(?:src|data-src|data-lazy-src)=["\']([^"\']+)', html, re.I):
-        url = _image_url(match.group(1))
-        if not url:
-            continue
-        if not any(url in [item if isinstance(item, str) else item.get("url") for item in result[kind]] for kind in ("main", "detail")):
-            _append_unique(result["unknown"], url)
+        _add_image_candidate(result, _image_url(og_image.group(1)), "main")
+    markup_parser = _ProductImageMarkupParser(result)
+    markup_parser.feed(html)
     for url in re.findall(r"https?:\\?/\\?/[^\"'\s<>]+?\.(?:jpg|jpeg|png|webp)", html, re.I):
-        _append_unique(result["unknown"], _image_url(url.replace("\\/", "/")))
-    if not result["main"] and result["unknown"]:
-        result["main"] = result["unknown"][:6]
-        result["detail"] = result["unknown"][6:]
-        result["unknown"] = []
-        result["notes"].append("未识别主图分组，按图片出现顺序划分主图 / 详情")
+        image_url = _image_url(url.replace("\\/", "/"))
+        _add_image_candidate(result, image_url, "unknown")
+    result["detailUrls"] = list(dict.fromkeys(
+        normalized for value in result["detailUrls"]
+        if (normalized := _normalize_detail_resource_url(value, result["sourceUrl"]))
+    ))[:3]
+    unknown_count = len(result["unknown"])
+    result["unknown"] = result["unknown"][:120]
+    if result["unknown"]:
+        result["notes"].append(f"有 {len(result['unknown'])} 张图片无法确定用途，已放入待确认")
+    if unknown_count > len(result["unknown"]):
+        result["notes"].append(f"页面图片较多，仅保留前 {len(result['unknown'])} 张待确认候选")
     result["main"] = [url for url in result["main"] if url][:12]
     result["detail"] = [url for url in result["detail"] if url][:120]
     result["sku"] = [item for item in result["sku"] if item.get("url")][:40]
@@ -411,22 +613,24 @@ def parse_html(html: str, base_url: str = "") -> dict:
     return result
 
 
-def parse_desc_html(text: str) -> dict:
+def parse_desc_html(text: str, base_url: str = "") -> dict:
     result = _new_result()
     match = re.search(r"var\s+offer_details\s*=\s*(\{.*?\})\s*;?\s*$", text, re.S)
     if not match:
         match = re.search(r"offer_details\s*=\s*(\{.*?\})\s*;", text, re.S)
-    if not match:
-        return result
-    try:
-        obj, _ = json.JSONDecoder().raw_decode(match.group(1), 0)
-    except (ValueError, json.JSONDecodeError):
-        return result
-    content = ""
-    if isinstance(obj, dict):
-        content = str(obj.get("content", ""))
-    for src in re.findall(r'<img[^>]+src=["\']([^"\']+)', content, re.I):
-        _append_unique(result["detail"], _image_url(src))
+    content = text
+    if match:
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(match.group(1), 0)
+        except (ValueError, json.JSONDecodeError):
+            obj = None
+        if isinstance(obj, dict):
+            content = str(obj.get("content", ""))
+    for src in re.findall(r'<(?:img|source)[^>]+(?:src|data-src|data-lazy-src)=["\']([^"\']+)', content, re.I):
+        _add_image_candidate(result, _image_url(urljoin(base_url, src)), "detail")
+    for style in re.findall(r'\bstyle=["\']([^"\']*url\([^)]+\)[^"\']*)["\']', content, re.I):
+        for src in re.findall(r"url\(\s*['\"]?([^)'\" ]+)['\"]?\s*\)", style, re.I):
+            _add_image_candidate(result, _image_url(urljoin(base_url, src)), "detail")
     result["detailText"] = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", content)).strip()[:4000]
     return result
 
@@ -444,7 +648,7 @@ def parse_bytes(filename: str, data: bytes) -> dict:
             parse_json_blob(obj, result)
             return result
     if lowered.endswith("desc.html") or "offer_details" in text:
-        desc = parse_desc_html(text)
+        desc = parse_desc_html(text, "")
         if desc["detail"]:
             return desc
     return parse_html(text, "")
@@ -459,6 +663,8 @@ def merge_results(results: list[dict]) -> dict:
         for key in ("main", "detail", "video", "unknown"):
             for item in result.get(key, []):
                 _append_unique(merged[key], item)
+        for item in result.get("detailUrls", []):
+            _append_unique(merged["detailUrls"], item)
         for item in result.get("sku", []):
             if item not in merged["sku"]:
                 merged["sku"].append(item)
@@ -487,6 +693,7 @@ def download_one(
     name: str,
     settings: dict,
     seen_hashes: set,
+    cookie: str = "",
 ) -> tuple[dict | None, str | None]:
     url = normalize_url(url)
     if not url:
@@ -495,7 +702,7 @@ def download_one(
     timeout = int(download.get("timeout", 30))
     retries = int(download.get("retries", 3))
     max_bytes = int(download.get("max_file_mb", 40)) * 1024 * 1024
-    headers = _headers(settings)
+    headers = _headers(settings, cookie=cookie)
     headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
     last_error = "未知错误"
     for attempt in range(max(1, retries)):
@@ -534,7 +741,7 @@ def download_one(
                     with Image.open(io.BytesIO(data)) as image:
                         width, height = image.size
                         image.verify()
-                    if min(width, height) < 120:
+                    if kind != "review" and min(width, height) < 120:
                         return None, "图片分辨率过低"
                 except Exception as exc:
                     return None, f"不是有效图片: {exc}"
@@ -554,11 +761,18 @@ def download_one(
     return None, last_error
 
 
-def download_all(task_id: str, parsed: dict, settings: dict, progress=None) -> dict:
+def download_all(task_id: str, parsed: dict, settings: dict, progress=None, cookie: str = "") -> dict:
     jobs = []
-    for kind in ("main", "detail", "sku", "video"):
+    parsed_kinds = (
+        ("main", "main"),
+        ("detail", "detail"),
+        ("sku", "sku"),
+        ("video", "video"),
+        ("review", "unknown"),
+    )
+    for kind, parsed_kind in parsed_kinds:
         seen_in_kind = set()
-        for index, item in enumerate(parsed.get(kind, []), 1):
+        for index, item in enumerate(parsed.get(parsed_kind, []), 1):
             url = item if isinstance(item, str) else item.get("url", "")
             name = "" if isinstance(item, str) else item.get("name", "")
             if not url or url in seen_in_kind:
@@ -568,13 +782,15 @@ def download_all(task_id: str, parsed: dict, settings: dict, progress=None) -> d
     total = len(jobs)
     if progress:
         progress(0, total)
-    records: dict[str, list[dict]] = {kind: [] for kind in ("main", "detail", "sku", "video")}
+    records: dict[str, list[dict]] = {kind: [] for kind in storage.RAW_KINDS}
     errors = []
     seen_hashes: dict[str, set] = {kind: set() for kind in records}
     workers = max(1, int(settings.get("download", {}).get("concurrency", 4)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(download_one, task_id, kind, index, url, name, settings, seen_hashes[kind]): (kind, url)
+            executor.submit(
+                download_one, task_id, kind, index, url, name, settings, seen_hashes[kind], cookie
+            ): (kind, url)
             for kind, index, url, name in jobs
         }
         done = 0
@@ -636,7 +852,7 @@ def build_sku(task_id: str, parsed: dict, records: dict) -> list[dict]:
     return sku
 
 
-def apply_parsed(task_id: str, parsed: dict, settings: dict, progress=None) -> dict:
+def apply_parsed(task_id: str, parsed: dict, settings: dict, progress=None, cookie: str = "") -> dict:
     def _update(meta):
         for key, source in (
             ("title", "title"),
@@ -649,11 +865,15 @@ def apply_parsed(task_id: str, parsed: dict, settings: dict, progress=None) -> d
             if value and not meta.get(key):
                 meta[key] = value
         meta["skuProps"] = parsed.get("skuProps", [])
-        storage.add_log(meta, f"解析完成：主图 {len(parsed.get('main', []))} / 详情 {len(parsed.get('detail', []))} / SKU {len(parsed.get('sku', []))}")
+        storage.add_log(
+            meta,
+            f"解析完成：主图 {len(parsed.get('main', []))} / 详情 {len(parsed.get('detail', []))} / "
+            f"SKU {len(parsed.get('sku', []))} / 待确认 {len(parsed.get('unknown', []))}",
+        )
         return meta
 
     storage.update_meta(task_id, _update)
-    result = download_all(task_id, parsed, settings, progress)
+    result = download_all(task_id, parsed, settings, progress, cookie=cookie)
     records = result["records"]
     sku = build_sku(task_id, parsed, records)
 
@@ -683,9 +903,23 @@ def apply_parsed(task_id: str, parsed: dict, settings: dict, progress=None) -> d
 def collect_from_url(task_id: str, url: str, settings: dict, cookie: str = "") -> dict:
     html, final_url = fetch_product_html(url, settings, cookie)
     parsed = parse_html(html, final_url)
-    if not parsed["main"] and not parsed["detail"] and not parsed["sku"]:
+    for detail_url in parsed.get("detailUrls", []):
+        detail_html, error = fetch_detail_resource(
+            detail_url, settings, cookie=cookie, referer=final_url,
+        )
+        if error:
+            parsed["notes"].append(f"详情素材资源未能读取：{error}")
+            continue
+        if detect_risk(detail_html):
+            parsed["notes"].append("详情素材资源触发了风控验证，已停止解析")
+            continue
+        detail_result = parse_desc_html(detail_html, detail_url)
+        if not detail_result["detail"]:
+            detail_result = parse_html(detail_html, detail_url)
+        parsed = merge_results([parsed, detail_result])
+    if not parsed["main"] and not parsed["detail"] and not parsed["sku"] and not parsed["unknown"]:
         raise CollectError("页面中没有识别到商品图片，请用“导入网页文件 / 导入文件夹 / 手动上传”方式")
-    return apply_parsed(task_id, parsed, settings)
+    return apply_parsed(task_id, parsed, settings, cookie=cookie)
 
 
 def _classify_path(path: Path) -> str | None:
@@ -762,8 +996,9 @@ def collect_from_folder(task_id: str, folder: str, settings: dict) -> dict:
     for kind, items in plan["files"].items():
         for index, item in enumerate(items, 1):
             try:
+                name = item.get("name") or (Path(item["path"]).stem if kind == "detail" else "")
                 records[kind].append(
-                    storage.copy_into_raw(task_id, item["path"], kind, index=index, name=item.get("name", ""), url=item.get("url", ""))
+                    storage.copy_into_raw(task_id, item["path"], kind, index=index, name=name, url=item.get("url", ""))
                 )
             except Exception as exc:
                 def _log_error(meta, rel=item["rel"], error=exc):
@@ -813,7 +1048,7 @@ def collect_from_folder(task_id: str, folder: str, settings: dict) -> dict:
 def collect_from_page_files(task_id: str, files: list[tuple[str, bytes]], settings: dict) -> dict:
     results = [parse_bytes(filename, data) for filename, data in files]
     parsed = merge_results(results)
-    if not parsed["main"] and not parsed["detail"] and not parsed["sku"]:
+    if not parsed["main"] and not parsed["detail"] and not parsed["sku"] and not parsed["unknown"]:
         raise CollectError("上传的文件里没有识别到商品图片，请确认保存的是商品页 HTML 或接口 JSON")
     return apply_parsed(task_id, parsed, settings)
 

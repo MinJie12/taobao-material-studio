@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+from PIL import Image, ImageCms, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 from . import config
 
@@ -93,6 +93,23 @@ def load_image(path) -> Image.Image:
     return im.convert("RGB")
 
 
+def remove_edge_background(image: Image.Image, tolerance: int = 36) -> tuple[Image.Image, list[int]]:
+    rgba = np.array(image.convert("RGBA"))
+    rgb = rgba[:, :, :3].astype(np.float32)
+    border = np.concatenate([
+        rgba[:3].reshape(-1, 4), rgba[-3:].reshape(-1, 4),
+        rgba[:, :3].reshape(-1, 4), rgba[:, -3:].reshape(-1, 4),
+    ])
+    opaque = border[border[:, 3] == 255]
+    if len(opaque) < len(border) / 2:
+        return Image.fromarray(rgba, "RGBA"), []
+    background = np.median(opaque[:, :3], axis=0)
+    distance = np.linalg.norm(rgb - background, axis=2)
+    alpha = np.clip((distance - tolerance) / (tolerance * 0.8), 0, 1)
+    rgba[:, :, 3] = (rgba[:, :, 3] * alpha).astype(np.uint8)
+    return Image.fromarray(rgba, "RGBA"), [int(value) for value in background]
+
+
 def fit_cover(im: Image.Image, size: tuple[int, int]) -> Image.Image:
     width, height = size
     iw, ih = im.size
@@ -114,6 +131,98 @@ def fit_contain(im: Image.Image, size: tuple[int, int], bg=(255, 255, 255), padd
     copy.thumbnail((inner_w, inner_h), RESAMPLE)
     canvas = Image.new("RGB", size, hex_to_rgb(bg) if not isinstance(bg, tuple) else bg[:3])
     canvas.paste(copy, ((width - copy.width) // 2, (height - copy.height) // 2))
+    return canvas
+
+
+def _clamp(value, low: float, high: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return low
+    return max(low, min(high, number))
+
+
+def _bg_rgb(bg) -> tuple[int, int, int]:
+    if isinstance(bg, (tuple, list)) and len(bg) >= 3:
+        return tuple(max(0, min(255, int(value))) for value in bg[:3])
+    return hex_to_rgb(bg)
+
+
+def fit_cover_focus(
+    im: Image.Image,
+    size: tuple[int, int],
+    zoom: float = 1.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    bg=(255, 255, 255),
+) -> Image.Image:
+    """铺满画框，并支持产品缩放与水平 / 垂直移动。
+
+    offset_x / offset_y 取值 -1 到 1：-1 表示贴左 / 贴上，0 居中，1 表示贴右 / 贴下。
+    缩放小于 1 时会用背景色补齐空白，方便操作者把产品放小。
+    """
+    width, height = size
+    iw, ih = im.size
+    if iw <= 0 or ih <= 0:
+        return Image.new("RGB", size, _bg_rgb(bg))
+    zoom = _clamp(zoom, 0.5, 3.0)
+    offset_x = _clamp(offset_x, -1.0, 1.0)
+    offset_y = _clamp(offset_y, -1.0, 1.0)
+    scale = max(width / iw, height / ih) * zoom
+    new_size = (max(1, int(math.ceil(iw * scale))), max(1, int(math.ceil(ih * scale))))
+    resized = im.resize(new_size, RESAMPLE)
+    canvas = Image.new("RGB", (width, height), _bg_rgb(bg))
+    if resized.width >= width and resized.height >= height:
+        free_x = resized.width - width
+        free_y = resized.height - height
+        left = int(round(free_x * (0.5 + offset_x * 0.5)))
+        top = int(round(free_y * (0.5 + offset_y * 0.5)))
+        return resized.crop((left, top, left + width, top + height))
+    if resized.width <= width:
+        x = int(round((width - resized.width) * (0.5 + offset_x * 0.5)))
+    else:
+        x = -int(round((resized.width - width) * (0.5 + offset_x * 0.5)))
+    if resized.height <= height:
+        y = int(round((height - resized.height) * (0.5 + offset_y * 0.5)))
+    else:
+        y = -int(round((resized.height - height) * (0.5 + offset_y * 0.5)))
+    canvas.paste(resized, (x, y))
+    return canvas
+
+
+def fit_contain_focus(
+    im: Image.Image,
+    size: tuple[int, int],
+    bg=(255, 255, 255),
+    padding: int = 0,
+    zoom: float = 1.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+) -> Image.Image:
+    """完整显示产品，同时支持在留白范围内移动和缩放。"""
+    width, height = size
+    inner_w = max(1, width - padding * 2)
+    inner_h = max(1, height - padding * 2)
+    copy = im.copy()
+    copy.thumbnail((inner_w, inner_h), RESAMPLE)
+    zoom = _clamp(zoom, 0.5, 3.0)
+    if zoom != 1.0:
+        copy = copy.resize(
+            (max(1, int(round(copy.width * zoom))), max(1, int(round(copy.height * zoom)))),
+            RESAMPLE,
+        )
+    canvas = Image.new("RGB", size, _bg_rgb(bg))
+    free_x = width - copy.width
+    free_y = height - copy.height
+    if free_x >= 0:
+        x = int(round(free_x / 2 + _clamp(offset_x, -1.0, 1.0) * free_x / 2))
+    else:
+        x = -int(round(-free_x * (0.5 + _clamp(offset_x, -1.0, 1.0) * 0.5)))
+    if free_y >= 0:
+        y = int(round(free_y / 2 + _clamp(offset_y, -1.0, 1.0) * free_y / 2))
+    else:
+        y = -int(round(-free_y * (0.5 + _clamp(offset_y, -1.0, 1.0) * 0.5)))
+    canvas.paste(copy, (x, y))
     return canvas
 
 
@@ -164,7 +273,10 @@ def add_gradient(canvas: Image.Image, box: tuple[int, int, int, int], top, botto
     x0, y0, x1, y1 = box
     width, height = max(1, x1 - x0), max(1, y1 - y0)
     gradient = vertical_gradient(width, height, top, bottom)
-    canvas.paste(gradient, (x0, y0), gradient)
+    if canvas.mode == "RGBA":
+        canvas.alpha_composite(gradient, (x0, y0))
+    else:
+        canvas.paste(gradient, (x0, y0), gradient)
 
 
 def text_metrics(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> tuple[int, int]:
@@ -364,11 +476,72 @@ def enhance(
     return im
 
 
+def load_detail_image(path) -> Image.Image:
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source)
+        alpha = image.convert("RGBA").getchannel("A") if (
+            "A" in image.getbands() or "transparency" in image.info
+        ) else None
+        profile = image.info.get("icc_profile")
+        if profile:
+            try:
+                image = ImageCms.profileToProfile(
+                    image if image.mode in ("RGB", "CMYK", "L", "LAB") else image.convert("RGB"),
+                    io.BytesIO(profile), ImageCms.createProfile("sRGB"), outputMode="RGB",
+                )
+            except (ImageCms.PyCMSError, OSError, ValueError):
+                image = image.convert("RGB")
+        else:
+            image = image.convert("RGB")
+        if alpha is not None:
+            image = Image.composite(image, Image.new("RGB", image.size, "white"), alpha)
+        return image
+
+
+def beautify_detail(image: Image.Image, *, upscaled: bool = False) -> Image.Image:
+    # Work on luminance so sharpening doesn't accentuate colored noise and JPEG fringes.
+    light = image.convert("L")
+    histogram = light.histogram()
+    shadow_share = sum(histogram[:64]) / (image.width * image.height)
+    strength = min(0.2, max(0.0, shadow_share - 0.18) * 0.4)
+    curve = [round(value + strength * value * (1 - value / 255) ** 2) for value in range(256)]
+    adjusted = light.point(curve).filter(ImageFilter.UnsharpMask(
+        radius=1.25 if upscaled else 0.95, percent=72 if upscaled else 48, threshold=4,
+    ))
+    delta = np.asarray(adjusted, dtype=np.int16) - np.asarray(light, dtype=np.int16)
+    rgb = np.asarray(image, dtype=np.int16)
+    return Image.fromarray(np.clip(rgb + delta[:, :, None], 0, 255).astype(np.uint8))
+
+
+def detail_segment_ranges(image: Image.Image, max_height: int) -> list[tuple[int, int]]:
+    height = image.height
+    count = (height + max_height - 1) // max_height
+    if count == 1:
+        return [(0, height)]
+    sample = image.convert("L").resize((min(96, image.width), height), Image.Resampling.BOX)
+    pixels = np.asarray(sample, dtype=np.float32)
+    activity = np.abs(np.diff(pixels, axis=0)).mean(axis=1)
+    activity = np.convolve(activity, np.ones(5) / 5, mode="same")
+    window = min(70, max_height // 12)
+    cuts = [0]
+    for remaining in range(count - 1, 0, -1):
+        start = cuts[-1]
+        ideal = start + (height - start) // (remaining + 1)
+        low = max(start + 1, height - remaining * max_height, ideal - window)
+        high = min(start + max_height, height - remaining, ideal + window)
+        cut = min(range(low, high + 1), key=lambda row: activity[row - 1] + 0.08 * abs(row - ideal))
+        cuts.append(cut)
+    return list(zip(cuts, cuts[1:] + [height]))
+
+
 def save_jpeg(
     im: Image.Image,
     path,
     target_bytes: int | None = None,
     max_bytes: int | None = None,
+    *,
+    subsampling: int = 2,
+    preferred_quality: int | None = None,
 ) -> dict:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -380,18 +553,20 @@ def save_jpeg(
         target_bytes = max_bytes
     for quality in qualities:
         buffer = io.BytesIO()
-        im.save(buffer, "JPEG", quality=quality, optimize=True, progressive=True, subsampling=2)
+        im.save(buffer, "JPEG", quality=quality, optimize=True, progressive=True, subsampling=subsampling)
         data = buffer.getvalue()
         best_data, best_quality = data, quality
         if target_bytes:
             if len(data) <= target_bytes:
+                break
+            if preferred_quality is not None and quality <= preferred_quality and (not max_bytes or len(data) <= max_bytes):
                 break
         elif max_bytes and len(data) <= max_bytes:
             break
     if max_bytes and len(best_data) > max_bytes:
         for quality in range(48, 29, -4):
             buffer = io.BytesIO()
-            im.save(buffer, "JPEG", quality=quality, optimize=True, progressive=True, subsampling=2)
+            im.save(buffer, "JPEG", quality=quality, optimize=True, progressive=True, subsampling=subsampling)
             if len(buffer.getvalue()) < len(best_data):
                 best_data, best_quality = buffer.getvalue(), quality
             if len(best_data) <= max_bytes:

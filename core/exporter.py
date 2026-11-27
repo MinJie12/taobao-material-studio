@@ -16,6 +16,7 @@ DEFAULT_SECTIONS = {
     "white": True,
     "detail": True,
     "sku": True,
+    "edited": True,
     "video": True,
     "keywords": True,
     "meta": True,
@@ -30,6 +31,7 @@ FOLDER_NAMES = {
     "video": "06_video",
     "keywords": "07_keywords",
     "meta": "08_meta",
+    "edited": "09_edited",
 }
 
 LABELS = {
@@ -38,6 +40,7 @@ LABELS = {
     "white": "白底图",
     "detail": "详情页图",
     "sku": "SKU 图",
+    "edited": "编辑成品",
     "video": "视频",
     "keywords": "关键词",
     "meta": "商品与素材信息",
@@ -81,7 +84,7 @@ def build_export(task_id: str, options: dict | None = None) -> dict:
     grouped: dict[str, list[str]] = {kind: [] for kind in FOLDER_NAMES}
     material_rows: list[list] = []
 
-    for kind in ("main_pc", "main_mobile", "white", "detail", "sku"):
+    for kind in ("main_pc", "main_mobile", "white", "detail", "sku", "edited"):
         if not sections.get(kind):
             continue
         for record in _iter_output_records(meta, kind):
